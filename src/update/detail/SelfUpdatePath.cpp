@@ -301,6 +301,55 @@ bool VerifyInstalledCopy(
         QueryFileSize(target, &targetSize, error) && sourceSize == targetSize;
 }
 
+bool NormalizeInstalledExecutableAttributes(
+    const std::filesystem::path& executable,
+    DWORD* error) noexcept {
+    if (error != nullptr) {
+        *error = ERROR_SUCCESS;
+    }
+
+    const DWORD attributes = ::GetFileAttributesW(executable.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (error != nullptr) {
+            *error = ::GetLastError();
+        }
+        return false;
+    }
+    if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        if (error != nullptr) {
+            *error = ERROR_CANT_ACCESS_FILE;
+        }
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_TEMPORARY) == 0) {
+        return true;
+    }
+
+    DWORD normalizedAttributes = attributes & ~FILE_ATTRIBUTE_TEMPORARY;
+    if (normalizedAttributes == 0) {
+        normalizedAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+    if (::SetFileAttributesW(
+            executable.c_str(), normalizedAttributes) == FALSE) {
+        if (error != nullptr) {
+            *error = ::GetLastError();
+        }
+        return false;
+    }
+
+    const DWORD verifiedAttributes = ::GetFileAttributesW(executable.c_str());
+    if (verifiedAttributes == INVALID_FILE_ATTRIBUTES ||
+        (verifiedAttributes & FILE_ATTRIBUTE_TEMPORARY) != 0) {
+        if (error != nullptr) {
+            *error = verifiedAttributes == INVALID_FILE_ATTRIBUTES
+                ? ::GetLastError()
+                : ERROR_INVALID_DATA;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool IsOwnedTemporaryUpdateExecutable(
     const std::filesystem::path& executable,
     DWORD* error) {

@@ -25,6 +25,10 @@ namespace qrec::update::detail {
     const std::filesystem::path& target,
     DWORD* error) noexcept;
 
+[[nodiscard]] bool NormalizeInstalledExecutableAttributes(
+    const std::filesystem::path& executable,
+    DWORD* error) noexcept;
+
 [[nodiscard]] bool IsOwnedTemporaryUpdateExecutable(
     const std::filesystem::path& executable,
     DWORD* error);

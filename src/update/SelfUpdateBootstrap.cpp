@@ -226,6 +226,17 @@ BootstrapResult ApplyUpdate(const ApplyUpdateRequest& request) noexcept {
                 backupExecutable);
         }
 
+        if (!detail::NormalizeInstalledExecutableAttributes(
+                targetExecutable,
+                &nativeError)) {
+            return InstallFailure(
+                BootstrapStage::InstallExecutable,
+                nativeError,
+                L"无法清除新版程序的临时文件属性，已尝试恢复旧版。",
+                targetExecutable,
+                backupExecutable);
+        }
+
         detail::InstalledProcess installedProcess;
         if (!detail::LaunchInstalledExecutable(
                 targetExecutable,
