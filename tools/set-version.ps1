@@ -86,23 +86,20 @@ function Write-Utf8StagingFile {
     )
 
     $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
-    $contentBytes = $utf8.GetBytes($Text)
-    $preamble = if ($WithBom) {
-        [byte[]]@(0xEF, 0xBB, 0xBF)
-    }
-    else {
-        [byte[]]@()
-    }
-    $bytes = New-Object byte[] ($preamble.Length + $contentBytes.Length)
-    if ($preamble.Length -gt 0) {
-        [System.Array]::Copy($preamble, 0, $bytes, 0, $preamble.Length)
+    [byte[]]$contentBytes = $utf8.GetBytes($Text)
+    $preambleLength = if ($WithBom) { 3 } else { 0 }
+    $bytes = New-Object byte[] ($preambleLength + $contentBytes.Length)
+    if ($WithBom) {
+        $bytes[0] = 0xEF
+        $bytes[1] = 0xBB
+        $bytes[2] = 0xBF
     }
     if ($contentBytes.Length -gt 0) {
         [System.Array]::Copy(
             $contentBytes,
             0,
             $bytes,
-            $preamble.Length,
+            $preambleLength,
             $contentBytes.Length
         )
     }
