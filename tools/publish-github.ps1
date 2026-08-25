@@ -583,7 +583,7 @@ try {
             '-C', $projectRoot,
             'push', '--atomic', 'origin',
             "HEAD:refs/heads/$branchName",
-            "refs/tags/$tagName:refs/tags/$tagName"
+            "refs/tags/${tagName}:refs/tags/${tagName}"
         ) `
         -EchoOutput | Out-Null
 
