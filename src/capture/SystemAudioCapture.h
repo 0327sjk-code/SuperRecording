@@ -107,11 +107,20 @@ public:
     [[nodiscard]] std::optional<SystemAudioRecordingResult> Stop(
         SystemAudioCaptureError* error = nullptr);
 
+    // minimumDuration 使用最终视频的有效时间线；捕获端会用静音补齐缺失区间。
+    [[nodiscard]] std::optional<SystemAudioRecordingResult> Stop(
+        std::chrono::nanoseconds minimumDuration,
+        SystemAudioCaptureError* error = nullptr);
+
     [[nodiscard]] SystemAudioCaptureState State() const noexcept;
     [[nodiscard]] SystemAudioCaptureStats Stats() const noexcept;
     [[nodiscard]] SystemAudioCaptureError LastError() const;
 
 private:
+    [[nodiscard]] std::optional<SystemAudioRecordingResult> StopInternal(
+        std::optional<std::chrono::nanoseconds> minimumDuration,
+        SystemAudioCaptureError* error);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

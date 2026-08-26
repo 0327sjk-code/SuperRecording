@@ -54,8 +54,10 @@ inline constexpr std::uint16_t kFloatBitsPerSample = 32;
 inline constexpr std::uint32_t kBitsPerByte = 8;
 inline constexpr std::uint32_t kRequestedBufferMilliseconds = 100;
 inline constexpr std::uint32_t kSilenceChunkMilliseconds = 100;
+inline constexpr std::uint32_t kMinimumAacSeedMilliseconds = 100;
 inline constexpr auto kCaptureWaitTimeout = 250ms;
 inline constexpr auto kStatsCallbackInterval = 250ms;
+inline constexpr auto kSilenceCatchUpHoldback = kCaptureWaitTimeout;
 
 void ClearError(SystemAudioCaptureError* error) {
     if (error != nullptr) {
@@ -120,6 +122,103 @@ void AssignError(
     return std::chrono::milliseconds(
         FrameTimestamp(frameCount, sampleRate) /
         kHundredNanosecondsPerMillisecond);
+}
+
+[[nodiscard]] std::uint64_t FramesForDurationCeiling(
+    const std::chrono::nanoseconds duration,
+    const std::uint32_t sampleRate) noexcept {
+    if (duration <= std::chrono::nanoseconds::zero() || sampleRate == 0) {
+        return 0;
+    }
+
+    constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+    const std::uint64_t nanoseconds =
+        static_cast<std::uint64_t>(duration.count());
+    const std::uint64_t wholeSeconds = nanoseconds / kNanosecondsPerSecond;
+    const std::uint64_t remainingNanoseconds =
+        nanoseconds % kNanosecondsPerSecond;
+    const std::uint64_t maximumWholeSeconds =
+        std::numeric_limits<std::uint64_t>::max() / sampleRate;
+    if (wholeSeconds > maximumWholeSeconds) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    const std::uint64_t wholeFrames = wholeSeconds * sampleRate;
+    const std::uint64_t partialFrames =
+        (remainingNanoseconds * sampleRate + kNanosecondsPerSecond - 1ULL) /
+        kNanosecondsPerSecond;
+    if (partialFrames >
+        std::numeric_limits<std::uint64_t>::max() - wholeFrames) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return wholeFrames + partialFrames;
+}
+
+[[nodiscard]] std::uint64_t FramesForHundredNanoseconds(
+    const std::uint64_t duration100Nanoseconds,
+    const std::uint32_t sampleRate,
+    const bool roundUp) noexcept {
+    constexpr std::uint64_t kTicksPerSecond =
+        static_cast<std::uint64_t>(kMediaFoundationTicksPerSecond);
+    if (sampleRate == 0) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const std::uint64_t wholeSeconds =
+        duration100Nanoseconds / kTicksPerSecond;
+    const std::uint64_t remainingTicks =
+        duration100Nanoseconds % kTicksPerSecond;
+    const std::uint64_t maximumWholeSeconds =
+        std::numeric_limits<std::uint64_t>::max() / sampleRate;
+    if (wholeSeconds > maximumWholeSeconds) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    const std::uint64_t wholeFrames = wholeSeconds * sampleRate;
+    std::uint64_t partialNumerator = remainingTicks * sampleRate;
+    if (roundUp && partialNumerator != 0) {
+        partialNumerator += kTicksPerSecond - 1ULL;
+    }
+    const std::uint64_t partialFrames = partialNumerator / kTicksPerSecond;
+    if (partialFrames >
+        std::numeric_limits<std::uint64_t>::max() - wholeFrames) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return wholeFrames + partialFrames;
+}
+
+[[nodiscard]] std::optional<std::uint64_t>
+QueryPerformanceCounter100Nanoseconds() noexcept {
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    if (!::QueryPerformanceCounter(&counter) ||
+        !::QueryPerformanceFrequency(&frequency) ||
+        counter.QuadPart < 0 || frequency.QuadPart <= 0) {
+        return std::nullopt;
+    }
+
+    constexpr std::uint64_t kTicksPerSecond =
+        static_cast<std::uint64_t>(kMediaFoundationTicksPerSecond);
+    const std::uint64_t counterValue =
+        static_cast<std::uint64_t>(counter.QuadPart);
+    const std::uint64_t frequencyValue =
+        static_cast<std::uint64_t>(frequency.QuadPart);
+    const std::uint64_t wholeSeconds = counterValue / frequencyValue;
+    const std::uint64_t remainder = counterValue % frequencyValue;
+    if (wholeSeconds >
+            std::numeric_limits<std::uint64_t>::max() / kTicksPerSecond ||
+        remainder >
+            std::numeric_limits<std::uint64_t>::max() / kTicksPerSecond) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t wholeTicks = wholeSeconds * kTicksPerSecond;
+    const std::uint64_t partialTicks =
+        remainder * kTicksPerSecond / frequencyValue;
+    if (partialTicks >
+        std::numeric_limits<std::uint64_t>::max() - wholeTicks) {
+        return std::nullopt;
+    }
+    return wholeTicks + partialTicks;
 }
 
 template <typename Callback, typename Value>
@@ -262,6 +361,7 @@ struct WasapiPacket final {
     std::uint32_t frameCount{};
     DWORD flags{};
     std::uint64_t devicePosition{};
+    std::uint64_t qpcPosition100Nanoseconds{};
 };
 
 class WasapiLoopbackSession final {
@@ -384,6 +484,7 @@ public:
         packet.frameCount = 0;
         packet.flags = 0;
         packet.devicePosition = 0;
+        packet.qpcPosition100Nanoseconds = 0;
         packet.samples.clear();
 
         UINT32 availableFrames = 0;
@@ -430,6 +531,7 @@ public:
         packet.frameCount = frameCount;
         packet.flags = flags;
         packet.devicePosition = devicePosition;
+        packet.qpcPosition100Nanoseconds = qpcPosition;
         const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
         const std::uint64_t byteCount64 =
             static_cast<std::uint64_t>(frameCount) * blockAlignment_;
@@ -470,8 +572,11 @@ class AudioTimelineWriter final {
 public:
     AudioTimelineWriter(
         media::AacAudioWriter& writer,
-        const std::uint32_t sampleRate) noexcept
-        : writer_(writer), sampleRate_(sampleRate) {}
+        const std::uint32_t sampleRate,
+        const std::uint32_t bytesPerFrame) noexcept
+        : writer_(writer),
+          sampleRate_(sampleRate),
+          bytesPerFrame_(bytesPerFrame) {}
 
     [[nodiscard]] bool ProcessPacket(
         const WasapiPacket& packet,
@@ -482,7 +587,9 @@ public:
         const bool discontinuity =
             (packet.flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
         if (!timestampReliable || discontinuity) {
-            hasDevicePosition_ = false;
+            ResetDeviceBaseline();
+            alignmentRequired_ =
+                segmentQpcStart100Nanoseconds_.has_value();
             ++stats_.discontinuityCount;
         }
 
@@ -492,26 +599,122 @@ public:
             return true;
         }
 
-        if (timestampReliable && hasDevicePosition_ &&
-            packet.devicePosition > devicePositionEnd_) {
-            const std::uint64_t gapFrames =
-                packet.devicePosition - devicePositionEnd_;
-            if (!WriteSilence(gapFrames, error)) {
-                return false;
+        std::uint64_t desiredStartFrame = stats_.encodedFrames;
+        std::uint64_t framesToSkip = 0;
+        bool alignedWithQpc = false;
+        if (alignmentRequired_) {
+            if (!timestampReliable ||
+                !segmentQpcStart100Nanoseconds_.has_value() ||
+                packet.qpcPosition100Nanoseconds == 0) {
+                return true;
+            }
+
+            alignedWithQpc = true;
+            if (packet.qpcPosition100Nanoseconds <
+                *segmentQpcStart100Nanoseconds_) {
+                framesToSkip = std::min<std::uint64_t>(
+                    FramesForHundredNanoseconds(
+                        *segmentQpcStart100Nanoseconds_ -
+                            packet.qpcPosition100Nanoseconds,
+                        sampleRate_,
+                        true),
+                    packet.frameCount);
+                desiredStartFrame = segmentTimelineStartFrame_;
+            } else {
+                const std::uint64_t segmentOffset =
+                    FramesForHundredNanoseconds(
+                        packet.qpcPosition100Nanoseconds -
+                            *segmentQpcStart100Nanoseconds_,
+                        sampleRate_,
+                        false);
+                if (segmentOffset >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        segmentTimelineStartFrame_) {
+                    error = MakeError(
+                        SystemAudioCaptureErrorCode::EncodeFailed,
+                        L"系统音频 QPC 时间线超出支持范围。",
+                        static_cast<long>(E_INVALIDARG));
+                    return false;
+                }
+                desiredStartFrame =
+                    segmentTimelineStartFrame_ + segmentOffset;
+            }
+
+            if (desiredStartFrame > stats_.encodedFrames) {
+                if (!WriteSilence(
+                        desiredStartFrame - stats_.encodedFrames,
+                        error)) {
+                    return false;
+                }
+            } else if (desiredStartFrame < stats_.encodedFrames &&
+                       framesToSkip < packet.frameCount) {
+                const std::uint64_t remainingFrames =
+                    packet.frameCount - framesToSkip;
+                framesToSkip += std::min<std::uint64_t>(
+                    stats_.encodedFrames - desiredStartFrame,
+                    remainingFrames);
+            }
+        } else if (timestampReliable && hasDevicePosition_) {
+            if (packet.devicePosition > devicePositionEnd_) {
+                const std::uint64_t gapFrames =
+                    packet.devicePosition - devicePositionEnd_;
+                if (!WriteSilence(gapFrames, error)) {
+                    return false;
+                }
+            } else if (packet.devicePosition < devicePositionEnd_) {
+                framesToSkip = std::min<std::uint64_t>(
+                    devicePositionEnd_ - packet.devicePosition,
+                    packet.frameCount);
             }
         }
 
+        if (framesToSkip >= packet.frameCount) {
+            UpdateDevicePosition(packet, timestampReliable);
+            return true;
+        }
+
+        const std::uint32_t skippedFrames =
+            static_cast<std::uint32_t>(framesToSkip);
+        const std::uint32_t outputFrames =
+            packet.frameCount - skippedFrames;
         const bool silent =
             (packet.flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+        std::span<const std::byte> outputSamples = packet.samples;
+        if (!silent && skippedFrames != 0) {
+            const std::uint64_t skippedBytes =
+                static_cast<std::uint64_t>(skippedFrames) * bytesPerFrame_;
+            if (skippedBytes > outputSamples.size()) {
+                error = MakeError(
+                    SystemAudioCaptureErrorCode::EncodeFailed,
+                    L"系统音频重叠样本的缓冲区长度无效。",
+                    static_cast<long>(E_INVALIDARG));
+                return false;
+            }
+            outputSamples = outputSamples.subspan(
+                static_cast<std::size_t>(skippedBytes));
+        }
+
         if (!WriteFrames(
-                packet.samples,
-                packet.frameCount,
+                outputSamples,
+                outputFrames,
                 silent,
                 error)) {
             return false;
         }
+        if (alignedWithQpc) {
+            alignmentRequired_ = false;
+        }
         UpdateDevicePosition(packet, timestampReliable);
         return true;
+    }
+
+    void BeginActiveSegment(
+        const std::optional<std::uint64_t> qpcPosition100Nanoseconds,
+        const std::uint64_t timelineStartFrame) noexcept {
+        segmentQpcStart100Nanoseconds_ = qpcPosition100Nanoseconds;
+        segmentTimelineStartFrame_ = timelineStartFrame;
+        ResetDeviceBaseline();
+        alignmentRequired_ = qpcPosition100Nanoseconds.has_value();
     }
 
     void ResetDeviceBaseline() noexcept {
@@ -521,6 +724,57 @@ public:
 
     [[nodiscard]] const SystemAudioCaptureStats& Stats() const noexcept {
         return stats_;
+    }
+
+    [[nodiscard]] bool EnsureMinimumDuration(
+        const std::chrono::nanoseconds minimumDuration,
+        SystemAudioCaptureError& error,
+        const bool ensureAacSeed = false) noexcept {
+        std::uint64_t targetFrames = FramesForDurationCeiling(
+            minimumDuration,
+            sampleRate_);
+        if (ensureAacSeed && targetFrames != 0) {
+            targetFrames = std::max(
+                targetFrames,
+                static_cast<std::uint64_t>(sampleRate_) *
+                    kMinimumAacSeedMilliseconds / 1'000U);
+        }
+        if (targetFrames <= stats_.encodedFrames) {
+            return true;
+        }
+        if (!WriteSilence(targetFrames - stats_.encodedFrames, error)) {
+            return false;
+        }
+        ResetDeviceBaseline();
+        alignmentRequired_ =
+            segmentQpcStart100Nanoseconds_.has_value();
+        return true;
+    }
+
+    [[nodiscard]] bool CatchUpSilence(
+        const std::chrono::nanoseconds activeDuration,
+        SystemAudioCaptureError& error) noexcept {
+        if (!segmentQpcStart100Nanoseconds_.has_value()) {
+            // QPC unavailable: preserve the device-position timeline and let
+            // Stop perform the final bounded silence fill.
+            return true;
+        }
+
+        const auto holdback =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                kSilenceCatchUpHoldback);
+        if (activeDuration <= holdback) {
+            return true;
+        }
+        const std::chrono::nanoseconds committedDuration =
+            activeDuration - holdback;
+        const std::uint64_t targetFrames = FramesForDurationCeiling(
+            committedDuration,
+            sampleRate_);
+        if (targetFrames <= stats_.encodedFrames) {
+            return true;
+        }
+        return EnsureMinimumDuration(committedDuration, error);
     }
 
 private:
@@ -535,7 +789,11 @@ private:
             devicePositionEnd_ = 0;
             return;
         }
-        devicePositionEnd_ = packet.devicePosition + packet.frameCount;
+        const std::uint64_t packetEnd =
+            packet.devicePosition + packet.frameCount;
+        devicePositionEnd_ = hasDevicePosition_
+            ? std::max(devicePositionEnd_, packetEnd)
+            : packetEnd;
         hasDevicePosition_ = true;
     }
 
@@ -615,9 +873,13 @@ private:
 
     media::AacAudioWriter& writer_;
     std::uint32_t sampleRate_{};
+    std::uint32_t bytesPerFrame_{};
     SystemAudioCaptureStats stats_{};
     std::uint64_t devicePositionEnd_{};
+    std::uint64_t segmentTimelineStartFrame_{};
+    std::optional<std::uint64_t> segmentQpcStart100Nanoseconds_;
     bool hasDevicePosition_{};
+    bool alignmentRequired_{};
 };
 
 [[nodiscard]] bool DrainAvailablePackets(
@@ -659,6 +921,7 @@ struct SystemAudioCapture::Impl final {
     bool starting{};
     bool stopRequested{};
     bool requestedPaused{};
+    std::optional<std::chrono::nanoseconds> requestedMinimumDuration;
     std::uint64_t commandGeneration{};
     std::uint64_t appliedCommandGeneration{};
     std::optional<SystemAudioRecordingResult> completedResult;
@@ -789,6 +1052,18 @@ struct SystemAudioCapture::Impl final {
             return;
         }
 
+        const std::optional<std::uint64_t> initialSegmentQpcStart =
+            QueryPerformanceCounter100Nanoseconds();
+        const Clock::time_point initialSegmentStarted = Clock::now();
+        const std::uint32_t bytesPerFrame =
+            static_cast<std::uint32_t>(config.channelCount) *
+            kFloatBitsPerSample / kBitsPerByte;
+        AudioTimelineWriter timeline(
+            writer,
+            config.sampleRate,
+            bytesPerFrame);
+        timeline.BeginActiveSegment(initialSegmentQpcStart, 0);
+
         {
             std::scoped_lock lock(stateMutex);
             state = SystemAudioCaptureState::Capturing;
@@ -798,9 +1073,20 @@ struct SystemAudioCapture::Impl final {
         startupResult.set_value(true);
         stateChanged.notify_all();
 
-        AudioTimelineWriter timeline(writer, config.sampleRate);
         SystemAudioCaptureError runtimeError{};
         bool capturePaused = false;
+        // This clock advances only while recording is active. Incremental
+        // silence keeps a zero-packet recording encoded before Stop is called.
+        std::chrono::nanoseconds completedActiveDuration{};
+        Clock::time_point activeSegmentStarted = initialSegmentStarted;
+        const auto activeDurationAt = [&](const Clock::time_point now) {
+            if (capturePaused) {
+                return completedActiveDuration;
+            }
+            return completedActiveDuration +
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - activeSegmentStarted);
+        };
         Clock::time_point nextStatsCallback =
             Clock::now() + kStatsCallbackInterval;
 
@@ -815,16 +1101,38 @@ struct SystemAudioCapture::Impl final {
             }
 
             if (control.generation != appliedCommandGeneration) {
-                if (!DrainAvailablePackets(
-                        session,
-                        timeline,
-                        true,
-                        runtimeError)) {
-                    break;
-                }
-                capturePaused = control.paused;
-                if (!capturePaused) {
-                    timeline.ResetDeviceBaseline();
+                if (control.paused && !capturePaused) {
+                    const Clock::time_point commandTime = Clock::now();
+                    completedActiveDuration = activeDurationAt(commandTime);
+                    if (!DrainAvailablePackets(
+                            session,
+                            timeline,
+                            false,
+                            runtimeError)) {
+                        break;
+                    }
+                    if (!timeline.EnsureMinimumDuration(
+                            completedActiveDuration,
+                            runtimeError)) {
+                        break;
+                    }
+                    capturePaused = true;
+                } else if (!control.paused && capturePaused) {
+                    if (!DrainAvailablePackets(
+                            session,
+                            timeline,
+                            true,
+                            runtimeError)) {
+                        break;
+                    }
+                    const std::optional<std::uint64_t> segmentQpcStart =
+                        QueryPerformanceCounter100Nanoseconds();
+                    const Clock::time_point commandTime = Clock::now();
+                    activeSegmentStarted = commandTime;
+                    capturePaused = false;
+                    timeline.BeginActiveSegment(
+                        segmentQpcStart,
+                        timeline.Stats().encodedFrames);
                 }
                 ApplyPauseCommand(capturePaused, control.generation);
             }
@@ -852,6 +1160,12 @@ struct SystemAudioCapture::Impl final {
             }
 
             const Clock::time_point now = Clock::now();
+            if (!capturePaused &&
+                !timeline.CatchUpSilence(
+                    activeDurationAt(now),
+                    runtimeError)) {
+                break;
+            }
             if (now >= nextStatsCallback) {
                 const SystemAudioCaptureStats snapshot = timeline.Stats();
                 {
@@ -863,6 +1177,14 @@ struct SystemAudioCapture::Impl final {
             }
         }
 
+        nativeResult = session.Stop();
+        if (FAILED(nativeResult) && !runtimeError) {
+            runtimeError = MakeWasapiError(
+                SystemAudioCaptureErrorCode::CaptureFailed,
+                L"停止系统回环音频流失败。",
+                nativeResult);
+        }
+
         if (!runtimeError) {
             static_cast<void>(DrainAvailablePackets(
                 session,
@@ -871,12 +1193,18 @@ struct SystemAudioCapture::Impl final {
                 runtimeError));
         }
 
-        nativeResult = session.Stop();
-        if (FAILED(nativeResult) && !runtimeError) {
-            runtimeError = MakeWasapiError(
-                SystemAudioCaptureErrorCode::CaptureFailed,
-                L"停止系统回环音频流失败。",
-                nativeResult);
+        std::optional<std::chrono::nanoseconds> minimumDuration;
+        {
+            std::scoped_lock lock(stateMutex);
+            minimumDuration = requestedMinimumDuration;
+        }
+        if (!runtimeError) {
+            const std::chrono::nanoseconds targetDuration =
+                minimumDuration.value_or(activeDurationAt(Clock::now()));
+            static_cast<void>(timeline.EnsureMinimumDuration(
+                targetDuration,
+                runtimeError,
+                true));
         }
 
         SystemAudioCaptureError finalizeError{};
@@ -989,6 +1317,7 @@ bool SystemAudioCapture::Start(
         impl_->terminalError = {};
         impl_->stopRequested = false;
         impl_->requestedPaused = false;
+        impl_->requestedMinimumDuration.reset();
         impl_->commandGeneration = 0;
         impl_->appliedCommandGeneration = 0;
         impl_->starting = true;
@@ -1128,12 +1457,31 @@ bool SystemAudioCapture::Resume(SystemAudioCaptureError* error) {
 
 std::optional<SystemAudioRecordingResult> SystemAudioCapture::Stop(
     SystemAudioCaptureError* error) {
+    return StopInternal(std::nullopt, error);
+}
+
+std::optional<SystemAudioRecordingResult> SystemAudioCapture::Stop(
+    const std::chrono::nanoseconds minimumDuration,
+    SystemAudioCaptureError* error) {
+    return StopInternal(
+        std::max(minimumDuration, std::chrono::nanoseconds::zero()),
+        error);
+}
+
+std::optional<SystemAudioRecordingResult> SystemAudioCapture::StopInternal(
+    const std::optional<std::chrono::nanoseconds> minimumDuration,
+    SystemAudioCaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
 
     {
         std::scoped_lock lock(impl_->stateMutex);
         if (impl_->state != SystemAudioCaptureState::Idle || impl_->starting) {
+            if (minimumDuration.has_value() &&
+                (!impl_->requestedMinimumDuration.has_value() ||
+                 *minimumDuration > *impl_->requestedMinimumDuration)) {
+                impl_->requestedMinimumDuration = minimumDuration;
+            }
             impl_->stopRequested = true;
             impl_->state = SystemAudioCaptureState::Finalizing;
             static_cast<void>(::SetEvent(impl_->controlEvent.Get()));

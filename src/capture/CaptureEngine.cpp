@@ -468,8 +468,15 @@ struct CaptureEngine::Impl final {
         SystemAudioRecording systemAudioRecording{};
         if (systemAudioStarted) {
             SystemAudioCaptureError systemAudioStopError;
+            using MediaFoundationDuration =
+                std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
+            const auto videoTimelineDuration =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    MediaFoundationDuration(encodedDuration100Nanoseconds));
             const std::optional<SystemAudioRecordingResult> audioResult =
-                systemAudioCapture.Stop(&systemAudioStopError);
+                systemAudioCapture.Stop(
+                    videoTimelineDuration,
+                    &systemAudioStopError);
             bool audioReliable = false;
             std::wstring audioDiagnostic;
             {
