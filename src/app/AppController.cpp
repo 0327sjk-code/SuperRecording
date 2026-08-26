@@ -153,8 +153,22 @@ bool AppController::Initialize() {
         logger_.Error(
             L"录制快捷键配置写入失败：" + configStore_.FilePath().wstring());
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
-    ::InitCommonControlsEx(&controls);
+    INITCOMMONCONTROLSEX controls{
+        sizeof(controls),
+        ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
+    ::SetLastError(ERROR_SUCCESS);
+    if (::InitCommonControlsEx(&controls) == FALSE) {
+        const DWORD commonControlsError = ::GetLastError();
+        const std::wstring commonControlsDetail = commonControlsError == ERROR_SUCCESS
+            ? L"Common Controls 未提供 Win32 错误码"
+            : win32::FormatLastError(commonControlsError);
+        logger_.Error(std::format(
+            L"Common Controls 初始化失败：classes=0x{:08X}，error={}：{}；"
+            L"程序将继续使用当前可用控件。",
+            controls.dwICC,
+            commonControlsError,
+            commonControlsDetail));
+    }
 
     const HRESULT mediaResult = ::MFStartup(MF_VERSION, MFSTARTUP_FULL);
     if (FAILED(mediaResult)) {

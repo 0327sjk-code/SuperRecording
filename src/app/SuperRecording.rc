@@ -1,7 +1,6 @@
 #pragma code_page(65001)
 #include "resource.h"
 
-1 RT_MANIFEST "src\\app\\SuperRecording.manifest"
 IDI_SUPER_RECORDING ICON "assets\\SuperRecording.ico"
 
 1 VERSIONINFO

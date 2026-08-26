@@ -78,6 +78,11 @@
       <AdditionalDependencies>d3d11.lib;dxgi.lib;mfplat.lib;mf.lib;mfreadwrite.lib;mfuuid.lib;mfplay.lib;evr.lib;windowscodecs.lib;ole32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;comctl32.lib;comdlg32.lib;dwmapi.lib;propsys.lib;strmiids.lib;uuid.lib;mmdevapi.lib;avrt.lib;gdiplus.lib;gdi32.lib;user32.lib;advapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <Manifest>
+      <AdditionalManifestFiles>$(ProjectDir)src\app\SuperRecording.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\**\*.cpp" />
   </ItemGroup>

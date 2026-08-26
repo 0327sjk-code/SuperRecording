@@ -756,12 +756,17 @@ private:
         saveButton_ = CreateButton(L"保存到本地", kSaveButtonId);
         statusText_ = CreateStatic(L"准备就绪", kStatusTextId, SS_LEFT | SS_CENTERIMAGE);
 
-        tooltipWindow_ = CreateTooltipWindow();
-        if (tooltipWindow_ == nullptr ||
-            !AddTooltip(trimStartButton_, L"设为起点") ||
-            !AddTooltip(trimEndButton_, L"设为终点")) {
+        const std::array controls{
+            previewHost_, headerTitle_, headerSubtitle_, rangeText_, timeline_.WindowHandle(),
+            speedControl_.WindowHandle(), trimStartButton_, trimEndButton_,
+            playButton_, timeText_, audioToggle_.WindowHandle(), formatLabel_,
+            mp4Radio_, gifRadio_, saveButton_,
+            copyButton_, statusText_};
+        if (std::ranges::any_of(controls, [](const HWND control) { return control == nullptr; })) {
             return false;
         }
+
+        InitializeTooltips();
 
         if (mp4Radio_ != nullptr) {
             ::SetWindowSubclass(
@@ -778,15 +783,6 @@ private:
                 reinterpret_cast<DWORD_PTR>(this));
         }
 
-        const std::array controls{
-            previewHost_, headerTitle_, headerSubtitle_, rangeText_, timeline_.WindowHandle(),
-            speedControl_.WindowHandle(), trimStartButton_, trimEndButton_,
-            playButton_, timeText_, audioToggle_.WindowHandle(), formatLabel_,
-            mp4Radio_, gifRadio_, saveButton_,
-            copyButton_, statusText_};
-        if (std::ranges::any_of(controls, [](const HWND control) { return control == nullptr; })) {
-            return false;
-        }
         SetControlFonts();
         timeline_.SetRange(duration_, trimStart_, trimEnd_);
         timeline_.SetPlayhead(std::chrono::milliseconds::zero());
@@ -845,21 +841,139 @@ private:
         return tooltip;
     }
 
+    void InitializeTooltips() noexcept {
+        try {
+            InitializeTooltipsUnchecked();
+        } catch (...) {
+            if (tooltipWindow_ != nullptr && ::IsWindow(tooltipWindow_) != FALSE) {
+                ::DestroyWindow(tooltipWindow_);
+            }
+            tooltipWindow_ = nullptr;
+            try {
+                WriteDiagnostic(
+                    L"编辑器 Tooltip 已降级：stage=Exception；"
+                    L"【/】按钮与快捷定界功能继续可用。");
+            } catch (...) {
+                // Tooltip 诊断本身也不能中断编辑器控件初始化。
+            }
+        }
+    }
+
+    void InitializeTooltipsUnchecked() {
+        ::SetLastError(ERROR_SUCCESS);
+        tooltipWindow_ = CreateTooltipWindow();
+        const DWORD creationError = ::GetLastError();
+        if (tooltipWindow_ == nullptr) {
+            const std::wstring creationDetail = creationError == ERROR_SUCCESS
+                ? L"Tooltip 控件未提供 Win32 错误码"
+                : win32::FormatLastError(creationError);
+            WriteDiagnostic(std::format(
+                L"编辑器 Tooltip 已降级：stage=CreateWindowExW，class={}，error={}：{}；"
+                L"【/】按钮与快捷定界功能继续可用。",
+                TOOLTIPS_CLASSW,
+                creationError,
+                creationDetail));
+            return;
+        }
+
+        const bool startTooltipAdded = AddTooltip(trimStartButton_, L"设为起点");
+        const bool endTooltipAdded = AddTooltip(trimEndButton_, L"设为终点");
+        if (startTooltipAdded && endTooltipAdded) {
+            return;
+        }
+
+        if (::IsWindow(tooltipWindow_) != FALSE) {
+            ::DestroyWindow(tooltipWindow_);
+        }
+        tooltipWindow_ = nullptr;
+        WriteDiagnostic(std::format(
+            L"编辑器 Tooltip 已整体降级：startRegistered={}，endRegistered={}；"
+            L"【/】按钮与快捷定界功能继续可用。",
+            startTooltipAdded ? L"是" : L"否",
+            endTooltipAdded ? L"是" : L"否"));
+    }
+
     bool AddTooltip(const HWND control, const wchar_t* text) const {
         if (tooltipWindow_ == nullptr || control == nullptr || text == nullptr) {
+            WriteDiagnostic(std::format(
+                L"编辑器 Tooltip 注册已跳过：tooltipAvailable={}，controlAvailable={}，"
+                L"textAvailable={}。",
+                tooltipWindow_ != nullptr ? L"是" : L"否",
+                control != nullptr ? L"是" : L"否",
+                text != nullptr ? L"是" : L"否"));
             return false;
         }
         TOOLINFOW information{};
-        information.cbSize = sizeof(information);
         information.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
         information.hwnd = window_;
         information.uId = reinterpret_cast<UINT_PTR>(control);
         information.lpszText = const_cast<wchar_t*>(text);
-        return ::SendMessageW(
-            tooltipWindow_,
-            TTM_ADDTOOLW,
-            0,
-            reinterpret_cast<LPARAM>(&information)) != FALSE;
+
+        const auto registerTool = [this, &information](
+                                      const UINT structureSize,
+                                      DWORD* const lastError) {
+            information.cbSize = structureSize;
+            ::SetLastError(ERROR_SUCCESS);
+            const LRESULT result = ::SendMessageW(
+                tooltipWindow_,
+                TTM_ADDTOOLW,
+                0,
+                reinterpret_cast<LPARAM>(&information));
+            if (lastError != nullptr) {
+                *lastError = ::GetLastError();
+            }
+            return result;
+        };
+
+        constexpr UINT primarySize = static_cast<UINT>(sizeof(TOOLINFOW));
+        DWORD primaryError = ERROR_SUCCESS;
+        const LRESULT primaryResult = registerTool(primarySize, &primaryError);
+        if (primaryResult != FALSE) {
+            return true;
+        }
+
+        constexpr UINT compatibilitySize =
+            static_cast<UINT>(TTTOOLINFOW_V1_SIZE);
+        DWORD compatibilityError = ERROR_SUCCESS;
+        LRESULT compatibilityResult = FALSE;
+        if constexpr (compatibilitySize != primarySize) {
+            compatibilityResult = registerTool(compatibilitySize, &compatibilityError);
+        }
+        if (compatibilityResult != FALSE) {
+            WriteDiagnostic(std::format(
+                L"编辑器 Tooltip 使用兼容结构注册：control={}，primaryCbSize={}，"
+                L"primaryResult={}，primaryError={}，compatibilityCbSize={}，"
+                L"compatibilityResult={}，compatibilityError={}。",
+                text,
+                primarySize,
+                static_cast<long long>(primaryResult),
+                primaryError,
+                compatibilitySize,
+                static_cast<long long>(compatibilityResult),
+                compatibilityError));
+            return true;
+        }
+
+        const std::wstring primaryDetail = primaryError == ERROR_SUCCESS
+            ? L"未提供 Win32 错误码"
+            : win32::FormatLastError(primaryError);
+        const std::wstring compatibilityDetail = compatibilityError == ERROR_SUCCESS
+            ? L"未提供 Win32 错误码"
+            : win32::FormatLastError(compatibilityError);
+        WriteDiagnostic(std::format(
+            L"编辑器 Tooltip 注册失败：control={}，primaryCbSize={}，primaryResult={}，"
+            L"primaryError={}：{}，compatibilityCbSize={}，compatibilityResult={}，"
+            L"compatibilityError={}：{}。",
+            text,
+            primarySize,
+            static_cast<long long>(primaryResult),
+            primaryError,
+            primaryDetail,
+            compatibilitySize,
+            static_cast<long long>(compatibilityResult),
+            compatibilityError,
+            compatibilityDetail));
+        return false;
     }
 
     static LRESULT CALLBACK FormatButtonSubclassProc(
