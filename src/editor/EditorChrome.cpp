@@ -1,6 +1,7 @@
 #include "editor/EditorChrome.h"
 
 #include "editor/EditorAudioToggle.h"
+#include "editor/EditorSpeedControl.h"
 #include "editor/EditorTheme.h"
 
 #include "ui/AntiAliasedDrawing.h"
@@ -796,7 +797,40 @@ EditorChromeLayout EditorChrome::CalculateLayout(
 
     const int contentWidth = std::max(1, width - margin * 2);
     const int rangeY = layout.editorPanelTop + Scale(window, 16);
-    SetRect(layout.rangeLabel, margin, rangeY, contentWidth, Scale(window, 26));
+    const int compactButtonWidth = Scale(window, 32);
+    const int compactButtonGap = Scale(window, 6);
+    const int speedGap = Scale(window, 10);
+    const int speedWidth = Scale(window, EditorSpeedControl::PreferredWidthDip);
+    int rangeToolbarRight = width - margin;
+    rangeToolbarRight -= compactButtonWidth;
+    SetRect(
+        layout.trimEndButton,
+        rangeToolbarRight,
+        rangeY,
+        compactButtonWidth,
+        Scale(window, EditorSpeedControl::HeightDip));
+    rangeToolbarRight -= compactButtonGap + compactButtonWidth;
+    SetRect(
+        layout.trimStartButton,
+        rangeToolbarRight,
+        rangeY,
+        compactButtonWidth,
+        Scale(window, EditorSpeedControl::HeightDip));
+    rangeToolbarRight -= speedGap + speedWidth;
+    SetRect(
+        layout.speedControl,
+        rangeToolbarRight,
+        rangeY,
+        speedWidth,
+        Scale(window, EditorSpeedControl::HeightDip));
+    SetRect(
+        layout.rangeLabel,
+        margin,
+        rangeY,
+        std::max(
+            1,
+            static_cast<int>(layout.speedControl.left) - margin - Scale(window, 12)),
+        Scale(window, 30));
     const int timelineY = rangeY + Scale(window, 30);
     SetRect(layout.timeline, margin, timelineY, contentWidth, Scale(window, 78));
 
@@ -1017,6 +1051,9 @@ bool EditorChrome::DrawButton(
     const bool isSegment =
         state.role == EditorButtonRole::SegmentLeft ||
         state.role == EditorButtonRole::SegmentRight;
+    const bool isTrimBoundary =
+        state.role == EditorButtonRole::TrimStart ||
+        state.role == EditorButtonRole::TrimEnd;
     const bool isPrimary = state.role == EditorButtonRole::Primary;
     const bool isPlay = state.role == EditorButtonRole::Play;
     const bool isCopy = state.role == EditorButtonRole::Secondary;
@@ -1206,6 +1243,19 @@ bool EditorChrome::DrawButton(
         fallbackLabel.resize(static_cast<std::size_t>(std::max(0, copiedLength)));
         labelText = fallbackLabel.c_str();
         labelLength = static_cast<int>(fallbackLabel.size());
+        static_cast<void>(::GetTextExtentPoint32W(
+            dc,
+            labelText,
+            labelLength,
+            &labelSize));
+    }
+
+    // Keep the semantic button names ("设为起点/终点") available to
+    // accessibility APIs while rendering only the compact bracket glyphs.
+    if (isTrimBoundary) {
+        labelText = state.role == EditorButtonRole::TrimStart ? L"【" : L"】";
+        labelLength = 1;
+        labelSize = {};
         static_cast<void>(::GetTextExtentPoint32W(
             dc,
             labelText,

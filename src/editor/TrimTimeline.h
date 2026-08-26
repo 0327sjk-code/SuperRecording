@@ -47,6 +47,8 @@ public:
         std::chrono::milliseconds trimStart,
         std::chrono::milliseconds trimEnd);
     void SetPlayhead(std::chrono::milliseconds position);
+    [[nodiscard]] bool CommitTrimStart(std::chrono::milliseconds position);
+    [[nodiscard]] bool CommitTrimEnd(std::chrono::milliseconds position);
     void SetEnabled(bool enabled);
     [[nodiscard]] bool ConsumePendingNotification(
         TimelineNotification* notification) noexcept;
@@ -54,6 +56,9 @@ public:
     [[nodiscard]] HWND WindowHandle() const noexcept { return window_; }
     [[nodiscard]] std::chrono::milliseconds TrimStart() const noexcept;
     [[nodiscard]] std::chrono::milliseconds TrimEnd() const noexcept;
+    [[nodiscard]] std::chrono::milliseconds Playhead() const noexcept {
+        return playhead_;
+    }
 
 private:
     using ActivePart = timeline_detail::HitTarget;
@@ -69,6 +74,7 @@ private:
     void PostPendingNotificationMessage() noexcept;
     void QueueNotificationForPart(ActivePart part, TimelineInteractionPhase phase);
     void CommitKeyboardAdjustment();
+    void ShowBoundaryFeedback(ActivePart part) noexcept;
     void SetHoverPart(ActivePart part) noexcept;
     void SetPressedPart(ActivePart part) noexcept;
     void SetFocusMotion(bool focused) noexcept;
@@ -101,6 +107,7 @@ private:
     ActivePart activePart_{ActivePart::None};
     ActivePart dragPart_{ActivePart::None};
     ActivePart hoverPart_{ActivePart::None};
+    ActivePart feedbackPart_{ActivePart::None};
     BoundarySnap boundarySnap_{BoundarySnap::None};
     int dragAnchorOffsetX_{};
     ui::MotionState startHoverMotion_{};

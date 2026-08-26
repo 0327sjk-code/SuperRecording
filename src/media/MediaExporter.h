@@ -24,6 +24,7 @@ enum class MediaExportDisposition : std::uint8_t {
     None,
     Transcoded,
     AudioMuxed,
+    CompressedRetimedPassthrough,
     BoundaryTrimmedHybrid,
     SmartTrimmedPassthrough,
     HardLinkedPassthrough,

@@ -171,6 +171,9 @@ bool MediaPreview::Play(std::wstring* errorMessage) {
         }
         return false;
     }
+    if (!ApplyPlaybackSpeed(errorMessage)) {
+        return false;
+    }
     const HRESULT result = player_->Play();
     if (FAILED(result) && errorMessage != nullptr) {
         *errorMessage = L"无法播放预览：" + win32::FormatError(result);
@@ -203,6 +206,57 @@ bool MediaPreview::Seek(
     ::PropVariantClear(&value);
     if (FAILED(result) && errorMessage != nullptr) {
         *errorMessage = L"无法定位预览：" + win32::FormatError(result);
+    }
+    return SUCCEEDED(result);
+}
+
+bool MediaPreview::SetPlaybackSpeedTenths(
+    const int playbackSpeedTenths,
+    std::wstring* errorMessage) {
+    if (playbackSpeedTenths < 1 || playbackSpeedTenths > 30) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"播放速度必须在 0.1× 到 3.0× 之间。";
+        }
+        return false;
+    }
+    playbackSpeedTenths_ = playbackSpeedTenths;
+    if (player_ == nullptr) {
+        return true;
+    }
+
+    MFP_MEDIAPLAYER_STATE state = MFP_MEDIAPLAYER_STATE_EMPTY;
+    if (FAILED(player_->GetState(&state)) ||
+        state == MFP_MEDIAPLAYER_STATE_EMPTY ||
+        state == MFP_MEDIAPLAYER_STATE_SHUTDOWN) {
+        // MFPlay 在异步媒体项尚未就绪时不允许设置速率。
+        // 保留用户选择，在下次 Play 前统一应用。
+        return true;
+    }
+    return ApplyPlaybackSpeed(errorMessage);
+}
+
+bool MediaPreview::ApplyPlaybackSpeed(std::wstring* errorMessage) {
+    if (player_ == nullptr) {
+        return false;
+    }
+    const float requestedRate = static_cast<float>(playbackSpeedTenths_) / 10.0F;
+    float slowestRate = 0.0F;
+    float fastestRate = 0.0F;
+    HRESULT result = player_->GetSupportedRates(
+        TRUE,
+        &slowestRate,
+        &fastestRate);
+    if (SUCCEEDED(result) &&
+        (requestedRate < slowestRate - 0.0001F ||
+         requestedRate > fastestRate + 0.0001F)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"当前视频解码器不支持该预览速度。";
+        }
+        return false;
+    }
+    result = player_->SetRate(requestedRate);
+    if (FAILED(result) && errorMessage != nullptr) {
+        *errorMessage = L"无法设置预览倍速：" + win32::FormatError(result);
     }
     return SUCCEEDED(result);
 }

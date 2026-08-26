@@ -38,16 +38,23 @@ public:
     [[nodiscard]] bool Play(std::wstring* errorMessage = nullptr);
     [[nodiscard]] bool Pause(std::wstring* errorMessage = nullptr);
     [[nodiscard]] bool Seek(std::chrono::milliseconds position, std::wstring* errorMessage = nullptr);
+    [[nodiscard]] bool SetPlaybackSpeedTenths(
+        int playbackSpeedTenths,
+        std::wstring* errorMessage = nullptr);
     [[nodiscard]] std::chrono::milliseconds Position() const noexcept;
     [[nodiscard]] std::chrono::milliseconds Duration() const noexcept;
     [[nodiscard]] bool IsPlaying() const noexcept;
     void UpdateVideo() noexcept;
 
 private:
+    [[nodiscard]] bool ApplyPlaybackSpeed(
+        std::wstring* errorMessage = nullptr);
+
     class Callback;
     Microsoft::WRL::ComPtr<IMFPMediaPlayer> player_;
     Callback* callback_{};
     bool mediaFoundationStarted_{};
+    int playbackSpeedTenths_{10};
 };
 
 }  // namespace qrec

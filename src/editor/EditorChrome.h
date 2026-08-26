@@ -19,6 +19,8 @@ enum class EditorStatusTone : unsigned char {
 
 enum class EditorButtonRole : unsigned char {
     Play,
+    TrimStart,
+    TrimEnd,
     SegmentLeft,
     SegmentRight,
     Primary,
@@ -38,6 +40,9 @@ struct EditorChromeLayout final {
     RECT previewStage{};
     RECT preview{};
     RECT rangeLabel{};
+    RECT speedControl{};
+    RECT trimStartButton{};
+    RECT trimEndButton{};
     RECT timeline{};
     RECT playButton{};
     RECT timeLabel{};

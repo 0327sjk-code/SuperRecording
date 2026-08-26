@@ -3,6 +3,7 @@
 #include "media/AudioVideoMuxer.h"
 
 #include "common/Win32Helpers.h"
+#include "media/AacAudioWriter.h"
 #include "media/Mp4BoundaryTrimmer.h"
 #include "media/Mp4Writer.h"
 
@@ -31,6 +32,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>
 #include <system_error>
 #include <vector>
 
@@ -52,8 +54,17 @@ constexpr auto kPassthroughRangeTolerance = std::chrono::milliseconds(2);
 constexpr std::uint32_t kGifMaximumWidth = 1280;
 constexpr std::uint32_t kGifMaximumHeight = 720;
 constexpr int kGifMaximumFramesPerSecond = 15;
+constexpr int kNormalPlaybackSpeedTenths = 10;
+constexpr std::uint32_t kAudioWriteChunkFrames = 4'096;
+constexpr std::size_t kAudioBandlimitedHalfTaps = 48;
+constexpr std::size_t kAudioBandlimitedTapCount =
+    kAudioBandlimitedHalfTaps * 2;
+constexpr double kAudioBandlimitHeadroom = 0.80;
+constexpr std::uint64_t kAudioCancellationPollFrames = 256;
+constexpr double kPi = 3.1415926535897932384626433832795;
 constexpr DWORD kAllSourceStreams = static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS);
 constexpr DWORD kFirstVideoStream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+constexpr DWORD kFirstAudioStream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
 constexpr DWORD kMediaSource = static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE);
 
 std::atomic_uint64_t gPartialSequence{0};
@@ -115,6 +126,29 @@ private:
     bool opened_{};
 };
 
+class TemporaryFileCleanup final {
+public:
+    explicit TemporaryFileCleanup(std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~TemporaryFileCleanup() noexcept {
+        if (!active_) {
+            return;
+        }
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    TemporaryFileCleanup(const TemporaryFileCleanup&) = delete;
+    TemporaryFileCleanup& operator=(const TemporaryFileCleanup&) = delete;
+
+    void Release() noexcept { active_ = false; }
+
+private:
+    std::filesystem::path path_;
+    bool active_{true};
+};
+
 std::wstring HResultMessage(const std::wstring_view action, const HRESULT result) {
     return std::wstring(action) + L"：" + win32::FormatError(result);
 }
@@ -146,6 +180,21 @@ std::chrono::milliseconds ToMilliseconds(const LONGLONG value) noexcept {
         std::max<LONGLONG>(0, value) / kHundredNanosecondsPerMillisecond);
 }
 
+LONGLONG ScaleMediaTicks(
+    const LONGLONG value,
+    const int playbackSpeedTenths) noexcept {
+    if (value <= 0 || playbackSpeedTenths < 1 ||
+        playbackSpeedTenths > 30) {
+        return 0;
+    }
+    const long double scaled = static_cast<long double>(value) *
+        kNormalPlaybackSpeedTenths /
+        static_cast<long double>(playbackSpeedTenths);
+    return static_cast<LONGLONG>(std::llround(std::min<long double>(
+        scaled,
+        static_cast<long double>(std::numeric_limits<LONGLONG>::max()))));
+}
+
 std::wstring LowercaseExtension(const std::filesystem::path& path) {
     std::wstring extension = path.extension().wstring();
     std::transform(
@@ -159,7 +208,8 @@ std::wstring LowercaseExtension(const std::filesystem::path& path) {
 }
 
 bool IsWholeRangeMp4(const ExportRequest& request) noexcept {
-    if (request.format != OutputFormat::Mp4 ||
+    if (request.playbackSpeedTenths != kNormalPlaybackSpeedTenths ||
+        request.format != OutputFormat::Mp4 ||
         request.recording.sourcePath.empty() ||
         request.trimStart > kPassthroughRangeTolerance ||
         request.recording.duration.count() <= 0) {
@@ -182,6 +232,34 @@ bool IsWholeRangeMp4(const ExportRequest& request) noexcept {
         kPassthroughRangeTolerance;
 }
 
+bool CoversWholeSourceRange(const ExportRequest& request) noexcept {
+    ExportRequest normalSpeedRequest = request;
+    normalSpeedRequest.playbackSpeedTenths = kNormalPlaybackSpeedTenths;
+    return IsWholeRangeMp4(normalSpeedRequest);
+}
+
+bool IsValidPlaybackSpeed(const int playbackSpeedTenths) noexcept {
+    return playbackSpeedTenths >= 1 && playbackSpeedTenths <= 30;
+}
+
+std::chrono::milliseconds ScaledOutputDuration(
+    const ExportRequest& request) noexcept {
+    if (!IsValidPlaybackSpeed(request.playbackSpeedTenths)) {
+        return {};
+    }
+    const auto sourceDuration = request.trimEnd > request.trimStart
+        ? request.trimEnd - request.trimStart
+        : request.recording.duration;
+    if (sourceDuration.count() <= 0) {
+        return {};
+    }
+    const std::int64_t scaledMilliseconds =
+        sourceDuration.count() * kNormalPlaybackSpeedTenths /
+        request.playbackSpeedTenths;
+    return std::chrono::milliseconds(
+        std::max<std::int64_t>(1, scaledMilliseconds));
+}
+
 std::filesystem::path PartialPathFor(const std::filesystem::path& destination) {
     const auto directory = destination.parent_path();
     const std::wstring extension = destination.extension().wstring();
@@ -194,6 +272,26 @@ std::filesystem::path PartialPathFor(const std::filesystem::path& destination) {
         ::GetCurrentProcessId(),
         sequence,
         extension);
+}
+
+std::filesystem::path TemporarySiblingPath(
+    const std::filesystem::path& destination,
+    const std::wstring_view role,
+    const std::wstring_view extension) {
+    const std::uint64_t sequence = gPartialSequence.fetch_add(
+        1,
+        std::memory_order_relaxed);
+    std::wstring normalizedExtension(extension);
+    if (!normalizedExtension.empty() && normalizedExtension.front() != L'.') {
+        normalizedExtension.insert(normalizedExtension.begin(), L'.');
+    }
+    return destination.parent_path() / std::format(
+        L"{}.qrec-{}-{}-{}{}",
+        destination.stem().wstring(),
+        role,
+        ::GetCurrentProcessId(),
+        sequence,
+        normalizedExtension);
 }
 
 bool PathsReferToSameFile(
@@ -359,6 +457,756 @@ HRESULT SeekSource(IMFSourceReader* reader, const LONGLONG position) {
     return result;
 }
 
+std::uint64_t AudioFramesForDuration(
+    const LONGLONG duration,
+    const std::uint32_t sampleRate) noexcept {
+    if (duration <= 0 || sampleRate == 0) {
+        return 0;
+    }
+    const long double frames = static_cast<long double>(duration) *
+        static_cast<long double>(sampleRate) / 10'000'000.0L;
+    return static_cast<std::uint64_t>(std::llround(frames));
+}
+
+LONGLONG AudioTicksForFrames(
+    const std::uint64_t frames,
+    const std::uint32_t sampleRate) noexcept {
+    if (sampleRate == 0) {
+        return 0;
+    }
+    const long double ticks = static_cast<long double>(frames) *
+        10'000'000.0L / static_cast<long double>(sampleRate);
+    return static_cast<LONGLONG>(std::llround(ticks));
+}
+
+class StreamingAudioSpeedResampler final {
+public:
+    StreamingAudioSpeedResampler(
+        media::AacAudioWriter* writer,
+        const std::uint32_t sampleRate,
+        const std::uint16_t channels,
+        const int playbackSpeedTenths,
+        const std::uint64_t targetInputFrames,
+        const std::stop_token stopToken)
+        : writer_(writer),
+          sampleRate_(sampleRate),
+          channels_(channels),
+          playbackSpeedTenths_(playbackSpeedTenths),
+          targetInputFrames_(targetInputFrames),
+          targetOutputFrames_(static_cast<std::uint64_t>(std::floor(
+              static_cast<long double>(targetInputFrames) *
+              kNormalPlaybackSpeedTenths /
+              static_cast<long double>(playbackSpeedTenths)))),
+          stopToken_(stopToken),
+          useBandlimitedResampling_(
+              playbackSpeedTenths > kNormalPlaybackSpeedTenths) {
+        targetOutputFrames_ = std::max<std::uint64_t>(1, targetOutputFrames_);
+        outputChunk_.reserve(
+            static_cast<std::size_t>(kAudioWriteChunkFrames) * channels_);
+        InitializeBandlimitedWeights();
+    }
+
+    [[nodiscard]] HRESULT AppendFrames(
+        const std::span<const std::int16_t> interleavedSamples,
+        std::uint64_t frameCount,
+        std::wstring* errorMessage) {
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        if (writer_ == nullptr || sampleRate_ == 0 || channels_ == 0 ||
+            interleavedSamples.size() < frameCount * channels_) {
+            return E_INVALIDARG;
+        }
+        frameCount = std::min(
+            frameCount,
+            targetInputFrames_ - std::min(
+                totalInputFrames_,
+                targetInputFrames_));
+        if (frameCount == 0) {
+            return S_OK;
+        }
+        const std::size_t sampleCount = static_cast<std::size_t>(
+            frameCount * channels_);
+        inputBuffer_.insert(
+            inputBuffer_.end(),
+            interleavedSamples.begin(),
+            interleavedSamples.begin() + sampleCount);
+        totalInputFrames_ += frameCount;
+        return Produce(false, errorMessage);
+    }
+
+    [[nodiscard]] HRESULT AppendSilence(
+        std::uint64_t frameCount,
+        std::wstring* errorMessage) {
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        std::vector<std::int16_t> silence(
+            static_cast<std::size_t>(kAudioWriteChunkFrames) * channels_,
+            0);
+        while (frameCount > 0) {
+            if (stopToken_.stop_requested()) {
+                return CancellationResult(errorMessage);
+            }
+            const std::uint64_t chunkFrames = std::min<std::uint64_t>(
+                frameCount,
+                kAudioWriteChunkFrames);
+            const HRESULT result = AppendFrames(
+                std::span<const std::int16_t>(
+                    silence.data(),
+                    static_cast<std::size_t>(chunkFrames) * channels_),
+                chunkFrames,
+                errorMessage);
+            if (FAILED(result)) {
+                return result;
+            }
+            frameCount -= chunkFrames;
+        }
+        return S_OK;
+    }
+
+    [[nodiscard]] HRESULT Finish(std::wstring* errorMessage) {
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        if (totalInputFrames_ < targetInputFrames_) {
+            const HRESULT silenceResult = AppendSilence(
+                targetInputFrames_ - totalInputFrames_,
+                errorMessage);
+            if (FAILED(silenceResult)) {
+                return silenceResult;
+            }
+        }
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        const HRESULT produceResult = Produce(true, errorMessage);
+        if (FAILED(produceResult)) {
+            return produceResult;
+        }
+        if (outputFramesGenerated_ != targetOutputFrames_) {
+            if (errorMessage != nullptr) {
+                *errorMessage = L"音频倍速重采样未生成完整目标时长。";
+            }
+            return MF_E_END_OF_STREAM;
+        }
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        return FlushOutput(errorMessage);
+    }
+
+    [[nodiscard]] std::uint64_t OutputFrames() const noexcept {
+        return outputFramesGenerated_;
+    }
+
+private:
+    using BandlimitedPhaseWeights =
+        std::array<double, kAudioBandlimitedTapCount>;
+
+    [[nodiscard]] HRESULT CancellationResult(
+        std::wstring* errorMessage) const noexcept {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"音频倍速处理已取消。";
+        }
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    }
+
+    void InitializeBandlimitedWeights() noexcept {
+        if (!useBandlimitedResampling_) {
+            return;
+        }
+        const double speed = static_cast<double>(playbackSpeedTenths_) /
+            kNormalPlaybackSpeedTenths;
+        const double cutoffRatio = std::clamp(
+            kAudioBandlimitHeadroom / speed,
+            0.05,
+            1.0);
+        for (std::size_t phase = 0;
+             phase < bandlimitedWeights_.size();
+             ++phase) {
+            BandlimitedPhaseWeights& weights = bandlimitedWeights_[phase];
+            const double fraction = static_cast<double>(phase) /
+                kNormalPlaybackSpeedTenths;
+            double weightSum = 0.0;
+            for (std::size_t tap = 0; tap < weights.size(); ++tap) {
+                const int offset = static_cast<int>(tap) -
+                    static_cast<int>(kAudioBandlimitedHalfTaps) + 1;
+                const double distance = fraction - offset;
+                const double normalizedDistance = distance /
+                    static_cast<double>(kAudioBandlimitedHalfTaps);
+                double window = 0.0;
+                if (std::abs(normalizedDistance) < 1.0) {
+                    window = 0.42 +
+                        0.5 * std::cos(kPi * normalizedDistance) +
+                        0.08 * std::cos(2.0 * kPi * normalizedDistance);
+                }
+                const double filteredDistance = cutoffRatio * distance;
+                const double sinc = std::abs(filteredDistance) < 1.0e-12
+                    ? 1.0
+                    : std::sin(kPi * filteredDistance) /
+                        (kPi * filteredDistance);
+                weights[tap] = cutoffRatio * sinc * window;
+                weightSum += weights[tap];
+            }
+            if (std::abs(weightSum) > 1.0e-12) {
+                for (double& weight : weights) {
+                    weight /= weightSum;
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] std::int16_t InputSample(
+        const std::uint64_t frameIndex,
+        const std::uint16_t channel) const noexcept {
+        const std::uint64_t relativeFrame = frameIndex - bufferStartFrame_;
+        const std::size_t sampleIndex = retainedSampleOffset_ +
+            static_cast<std::size_t>(relativeFrame * channels_ + channel);
+        return inputBuffer_[sampleIndex];
+    }
+
+    [[nodiscard]] std::int16_t BandlimitedInputSample(
+        const std::uint64_t sourcePositionTenths,
+        const std::uint16_t channel) const noexcept {
+        const std::uint64_t centerFrame =
+            sourcePositionTenths / kNormalPlaybackSpeedTenths;
+        const std::size_t phase = static_cast<std::size_t>(
+            sourcePositionTenths % kNormalPlaybackSpeedTenths);
+        const BandlimitedPhaseWeights& weights = bandlimitedWeights_[phase];
+        const std::int64_t lastInputFrame = static_cast<std::int64_t>(
+            targetInputFrames_ - 1);
+        double filtered = 0.0;
+        for (std::size_t tap = 0; tap < weights.size(); ++tap) {
+            const std::int64_t offset = static_cast<std::int64_t>(tap) -
+                static_cast<std::int64_t>(kAudioBandlimitedHalfTaps) + 1;
+            const std::int64_t requestedFrame =
+                static_cast<std::int64_t>(centerFrame) + offset;
+            const std::uint64_t inputFrame = static_cast<std::uint64_t>(
+                std::clamp<std::int64_t>(
+                    requestedFrame,
+                    0,
+                    lastInputFrame));
+            filtered += static_cast<double>(InputSample(inputFrame, channel)) *
+                weights[tap];
+        }
+        return static_cast<std::int16_t>(std::clamp<long long>(
+            std::llround(filtered),
+            std::numeric_limits<std::int16_t>::min(),
+            std::numeric_limits<std::int16_t>::max()));
+    }
+
+    [[nodiscard]] bool HasBandlimitedLookahead(
+        const std::uint64_t sourcePositionTenths,
+        const bool finalInput) const noexcept {
+        if (finalInput) {
+            return totalInputFrames_ >= targetInputFrames_;
+        }
+        const std::uint64_t centerFrame =
+            sourcePositionTenths / kNormalPlaybackSpeedTenths;
+        const std::uint64_t requiredExclusive = centerFrame >
+                std::numeric_limits<std::uint64_t>::max() -
+                    kAudioBandlimitedHalfTaps - 1
+            ? std::numeric_limits<std::uint64_t>::max()
+            : centerFrame + kAudioBandlimitedHalfTaps + 1;
+        return totalInputFrames_ >= std::min(
+            requiredExclusive,
+            targetInputFrames_);
+    }
+
+    void DiscardConsumedInput() {
+        const std::uint64_t nextSourceFrame =
+            outputFramesGenerated_ *
+            static_cast<std::uint64_t>(playbackSpeedTenths_) /
+            kNormalPlaybackSpeedTenths;
+        const std::uint64_t retainedHistoryFrames =
+            useBandlimitedResampling_
+            ? kAudioBandlimitedHalfTaps + 1
+            : 1;
+        const std::uint64_t safeStart =
+            nextSourceFrame > retainedHistoryFrames
+            ? nextSourceFrame - retainedHistoryFrames
+            : 0;
+        if (safeStart <= bufferStartFrame_) {
+            return;
+        }
+        const std::uint64_t discardedFrames = std::min(
+            safeStart - bufferStartFrame_,
+            totalInputFrames_ - bufferStartFrame_);
+        retainedSampleOffset_ += static_cast<std::size_t>(
+            discardedFrames * channels_);
+        bufferStartFrame_ += discardedFrames;
+
+        constexpr std::size_t kCompactionThresholdSamples = 131'072;
+        if (retainedSampleOffset_ >= kCompactionThresholdSamples) {
+            inputBuffer_.erase(
+                inputBuffer_.begin(),
+                inputBuffer_.begin() +
+                    static_cast<std::ptrdiff_t>(retainedSampleOffset_));
+            retainedSampleOffset_ = 0;
+        }
+    }
+
+    [[nodiscard]] HRESULT FlushOutput(std::wstring* errorMessage) {
+        if (stopToken_.stop_requested()) {
+            return CancellationResult(errorMessage);
+        }
+        if (outputChunk_.empty()) {
+            return S_OK;
+        }
+        const std::uint32_t frameCount = static_cast<std::uint32_t>(
+            outputChunk_.size() / channels_);
+        const LONGLONG timestamp = AudioTicksForFrames(
+            outputFramesWritten_,
+            sampleRate_);
+        const LONGLONG endTimestamp = AudioTicksForFrames(
+            outputFramesWritten_ + frameCount,
+            sampleRate_);
+        std::wstring writerError;
+        long nativeError = 0;
+        const std::span<const std::int16_t> sampleSpan(outputChunk_);
+        if (!writer_->WriteInterleavedFrames(
+                std::as_bytes(sampleSpan),
+                frameCount,
+                timestamp,
+                std::max<LONGLONG>(1, endTimestamp - timestamp),
+                writerError,
+                nativeError)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = std::move(writerError);
+            }
+            return static_cast<HRESULT>(nativeError);
+        }
+        outputFramesWritten_ += frameCount;
+        outputChunk_.clear();
+        return S_OK;
+    }
+
+    [[nodiscard]] HRESULT Produce(
+        const bool finalInput,
+        std::wstring* errorMessage) {
+        while (outputFramesGenerated_ < targetOutputFrames_) {
+            if (outputFramesGenerated_ % kAudioCancellationPollFrames == 0 &&
+                stopToken_.stop_requested()) {
+                return CancellationResult(errorMessage);
+            }
+            const std::uint64_t sourcePositionTenths =
+                outputFramesGenerated_ *
+                static_cast<std::uint64_t>(playbackSpeedTenths_);
+            const std::uint64_t firstFrame =
+                sourcePositionTenths / kNormalPlaybackSpeedTenths;
+            std::uint64_t secondFrame = firstFrame + 1;
+            if (firstFrame >= targetInputFrames_) {
+                break;
+            }
+            if (useBandlimitedResampling_ &&
+                !HasBandlimitedLookahead(sourcePositionTenths, finalInput)) {
+                break;
+            }
+            if (secondFrame >= targetInputFrames_) {
+                if (!finalInput && totalInputFrames_ < targetInputFrames_) {
+                    break;
+                }
+                secondFrame = targetInputFrames_ - 1;
+            }
+            if (firstFrame >= totalInputFrames_ ||
+                secondFrame >= totalInputFrames_) {
+                break;
+            }
+
+            const std::uint64_t fractionalTenths =
+                sourcePositionTenths % kNormalPlaybackSpeedTenths;
+            for (std::uint16_t channel = 0; channel < channels_; ++channel) {
+                if (useBandlimitedResampling_) {
+                    outputChunk_.push_back(BandlimitedInputSample(
+                        sourcePositionTenths,
+                        channel));
+                } else {
+                    const std::int32_t first = InputSample(firstFrame, channel);
+                    const std::int32_t second = InputSample(secondFrame, channel);
+                    const std::int32_t interpolated = first +
+                        static_cast<std::int32_t>(std::llround(
+                            static_cast<double>(second - first) *
+                            static_cast<double>(fractionalTenths) /
+                            kNormalPlaybackSpeedTenths));
+                    outputChunk_.push_back(static_cast<std::int16_t>(std::clamp(
+                        interpolated,
+                        static_cast<std::int32_t>(
+                            std::numeric_limits<std::int16_t>::min()),
+                        static_cast<std::int32_t>(
+                            std::numeric_limits<std::int16_t>::max()))));
+                }
+            }
+            ++outputFramesGenerated_;
+            if (outputChunk_.size() >=
+                static_cast<std::size_t>(kAudioWriteChunkFrames) * channels_) {
+                const HRESULT flushResult = FlushOutput(errorMessage);
+                if (FAILED(flushResult)) {
+                    return flushResult;
+                }
+            }
+            DiscardConsumedInput();
+        }
+        return S_OK;
+    }
+
+    media::AacAudioWriter* writer_{};
+    std::uint32_t sampleRate_{};
+    std::uint16_t channels_{};
+    int playbackSpeedTenths_{kNormalPlaybackSpeedTenths};
+    std::uint64_t targetInputFrames_{};
+    std::uint64_t targetOutputFrames_{};
+    std::vector<std::int16_t> inputBuffer_;
+    std::size_t retainedSampleOffset_{};
+    std::uint64_t bufferStartFrame_{};
+    std::uint64_t totalInputFrames_{};
+    std::vector<std::int16_t> outputChunk_;
+    std::uint64_t outputFramesGenerated_{};
+    std::uint64_t outputFramesWritten_{};
+    std::stop_token stopToken_;
+    bool useBandlimitedResampling_{};
+    std::array<
+        BandlimitedPhaseWeights,
+        kNormalPlaybackSpeedTenths> bandlimitedWeights_{};
+};
+
+HRESULT RetimeAudioSidecar(
+    const ExportRequest& request,
+    const std::filesystem::path& outputPath,
+    const MediaExporter::ProgressCallback& progress,
+    const std::stop_token stopToken,
+    std::wstring* errorMessage) {
+    if (!IsValidPlaybackSpeed(request.playbackSpeedTenths) ||
+        request.trimEnd <= request.trimStart || outputPath.empty() ||
+        request.recording.systemAudio.sourcePath.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"音频倍速参数无效。";
+        }
+        return E_INVALIDARG;
+    }
+    if (stopToken.stop_requested()) {
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    }
+
+    const win32::ScopedCoInitialize apartment(COINIT_MULTITHREADED);
+    if (FAILED(apartment.Result()) &&
+        apartment.Result() != RPC_E_CHANGED_MODE) {
+        if (errorMessage != nullptr) {
+            *errorMessage = HResultMessage(
+                L"无法初始化音频倍速线程",
+                apartment.Result());
+        }
+        return apartment.Result();
+    }
+    const ScopedMediaFoundation mediaFoundation;
+    if (FAILED(mediaFoundation.Result())) {
+        if (errorMessage != nullptr) {
+            *errorMessage = HResultMessage(
+                L"无法启动音频倍速 Media Foundation",
+                mediaFoundation.Result());
+        }
+        return mediaFoundation.Result();
+    }
+
+    ComPtr<IMFAttributes> readerAttributes;
+    HRESULT result = ::MFCreateAttributes(&readerAttributes, 3);
+    if (SUCCEEDED(result)) {
+        result = readerAttributes->SetUINT32(
+            MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+            TRUE);
+    }
+    ComPtr<IMFSourceReader> reader;
+    if (SUCCEEDED(result)) {
+        result = ::MFCreateSourceReaderFromURL(
+            request.recording.systemAudio.sourcePath.c_str(),
+            readerAttributes.Get(),
+            &reader);
+    }
+    if (FAILED(result)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = HResultMessage(L"无法读取电脑声音轨道", result);
+        }
+        return result;
+    }
+    static_cast<void>(reader->SetStreamSelection(kAllSourceStreams, FALSE));
+    result = reader->SetStreamSelection(kFirstAudioStream, TRUE);
+
+    ComPtr<IMFMediaType> nativeAudioType;
+    if (SUCCEEDED(result)) {
+        result = reader->GetNativeMediaType(
+            kFirstAudioStream,
+            0,
+            &nativeAudioType);
+    }
+    UINT32 sampleRate = 0;
+    UINT32 channelCount = 0;
+    UINT32 channelMask = 0;
+    if (SUCCEEDED(result)) {
+        result = nativeAudioType->GetUINT32(
+            MF_MT_AUDIO_SAMPLES_PER_SECOND,
+            &sampleRate);
+    }
+    if (SUCCEEDED(result)) {
+        result = nativeAudioType->GetUINT32(
+            MF_MT_AUDIO_NUM_CHANNELS,
+            &channelCount);
+    }
+    static_cast<void>(nativeAudioType != nullptr
+        ? nativeAudioType->GetUINT32(MF_MT_AUDIO_CHANNEL_MASK, &channelMask)
+        : E_POINTER);
+    if (FAILED(result) || sampleRate < 8'000 || sampleRate > 96'000 ||
+        channelCount == 0 || channelCount > 2) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"电脑声音的采样率或声道数不支持倍速导出。";
+        }
+        return FAILED(result) ? result : MF_E_INVALIDMEDIATYPE;
+    }
+
+    const UINT32 blockAlignment = channelCount * sizeof(std::int16_t);
+    ComPtr<IMFMediaType> decodedAudioType;
+    result = ::MFCreateMediaType(&decodedAudioType);
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetGUID(
+            MF_MT_MAJOR_TYPE,
+            MFMediaType_Audio);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetGUID(
+            MF_MT_SUBTYPE,
+            MFAudioFormat_PCM);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_SAMPLES_PER_SECOND,
+            sampleRate);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_NUM_CHANNELS,
+            channelCount);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_BITS_PER_SAMPLE,
+            16);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_VALID_BITS_PER_SAMPLE,
+            16);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_BLOCK_ALIGNMENT,
+            blockAlignment);
+    }
+    if (SUCCEEDED(result)) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            sampleRate * blockAlignment);
+    }
+    if (SUCCEEDED(result) && channelMask != 0) {
+        result = decodedAudioType->SetUINT32(
+            MF_MT_AUDIO_CHANNEL_MASK,
+            channelMask);
+    }
+    if (SUCCEEDED(result)) {
+        result = reader->SetCurrentMediaType(
+            kFirstAudioStream,
+            nullptr,
+            decodedAudioType.Get());
+    }
+    if (FAILED(result)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = HResultMessage(L"无法解码电脑声音以执行倍速", result);
+        }
+        return result;
+    }
+
+    const LONGLONG trimStart = ToHundredNanoseconds(request.trimStart);
+    const LONGLONG trimEnd = ToHundredNanoseconds(request.trimEnd);
+    constexpr LONGLONG kAudioSeekPreroll = 10'000'000;
+    result = SeekSource(reader.Get(), std::max<LONGLONG>(
+        0,
+        trimStart - std::min(trimStart, kAudioSeekPreroll)));
+    if (FAILED(result)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = HResultMessage(L"无法定位电脑声音裁剪起点", result);
+        }
+        return result;
+    }
+
+    TemporaryFileCleanup failedOutputCleanup(outputPath);
+    media::AacAudioWriter writer;
+    media::AacAudioWriterConfig writerConfig{};
+    writerConfig.outputPath = outputPath;
+    writerConfig.inputFormat.sampleRate = sampleRate;
+    writerConfig.inputFormat.channelCount = static_cast<std::uint16_t>(
+        channelCount);
+    writerConfig.inputFormat.encoding = media::InterleavedAudioEncoding::SignedPcm;
+    writerConfig.inputFormat.containerBitsPerSample = 16;
+    writerConfig.inputFormat.validBitsPerSample = 16;
+    writerConfig.inputFormat.channelMask = channelMask;
+    writerConfig.preferHardwareEncoder = true;
+    std::wstring writerError;
+    long writerNativeError = 0;
+    if (!writer.Open(writerConfig, writerError, writerNativeError)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = std::move(writerError);
+        }
+        return static_cast<HRESULT>(writerNativeError);
+    }
+
+    const std::uint64_t targetInputFrames = AudioFramesForDuration(
+        trimEnd - trimStart,
+        sampleRate);
+    if (targetInputFrames == 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"音频裁剪区间太短，无法执行倍速。";
+        }
+        return E_INVALIDARG;
+    }
+    StreamingAudioSpeedResampler resampler(
+        &writer,
+        sampleRate,
+        static_cast<std::uint16_t>(channelCount),
+        request.playbackSpeedTenths,
+        targetInputFrames,
+        stopToken);
+    std::uint64_t appendedInputFrames = 0;
+    ReportProgress(progress, 0.80, L"正在重采样电脑声音…");
+
+    for (;;) {
+        if (stopToken.stop_requested()) {
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        }
+        DWORD actualStream = 0;
+        DWORD flags = 0;
+        LONGLONG sampleTime = 0;
+        ComPtr<IMFSample> sample;
+        result = reader->ReadSample(
+            kFirstAudioStream,
+            0,
+            &actualStream,
+            &flags,
+            &sampleTime,
+            &sample);
+        static_cast<void>(actualStream);
+        if (FAILED(result) || (flags & MF_SOURCE_READERF_ERROR) != 0) {
+            const HRESULT readError = FAILED(result) ? result : E_FAIL;
+            if (errorMessage != nullptr) {
+                *errorMessage = HResultMessage(L"读取电脑声音 PCM 样本失败", readError);
+            }
+            return readError;
+        }
+        if ((flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED |
+                      MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED)) != 0) {
+            if (errorMessage != nullptr) {
+                *errorMessage = L"电脑声音轨道在倍速过程中改变了媒体类型。";
+            }
+            return MF_E_INVALIDMEDIATYPE;
+        }
+        if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) {
+            break;
+        }
+        if (sample == nullptr) {
+            continue;
+        }
+
+        ComPtr<IMFMediaBuffer> buffer;
+        result = sample->ConvertToContiguousBuffer(&buffer);
+        if (FAILED(result)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = HResultMessage(L"合并电脑声音 PCM 缓冲区失败", result);
+            }
+            return result;
+        }
+        BYTE* bytes = nullptr;
+        DWORD maximumLength = 0;
+        DWORD currentLength = 0;
+        result = buffer->Lock(&bytes, &maximumLength, &currentLength);
+        if (FAILED(result)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = HResultMessage(L"锁定电脑声音 PCM 缓冲区失败", result);
+            }
+            return result;
+        }
+        static_cast<void>(maximumLength);
+        const std::uint64_t sampleFrames = currentLength / blockAlignment;
+        const std::int64_t sampleStartFrame = static_cast<std::int64_t>(
+            std::llround(
+                static_cast<long double>(sampleTime - trimStart) *
+                sampleRate / 10'000'000.0L));
+        const std::int64_t sampleEndFrame = sampleStartFrame +
+            static_cast<std::int64_t>(sampleFrames);
+        const std::int64_t copyStart = std::min<std::int64_t>(
+            static_cast<std::int64_t>(targetInputFrames),
+            std::max<std::int64_t>(
+                static_cast<std::int64_t>(appendedInputFrames),
+                std::max<std::int64_t>(0, sampleStartFrame)));
+        const std::int64_t copyEnd = std::min<std::int64_t>(
+            static_cast<std::int64_t>(targetInputFrames),
+            sampleEndFrame);
+
+        HRESULT appendResult = S_OK;
+        if (copyStart > static_cast<std::int64_t>(appendedInputFrames)) {
+            appendResult = resampler.AppendSilence(
+                static_cast<std::uint64_t>(copyStart) - appendedInputFrames,
+                errorMessage);
+            appendedInputFrames = static_cast<std::uint64_t>(copyStart);
+        }
+        if (SUCCEEDED(appendResult) && copyEnd > copyStart) {
+            const std::uint64_t sourceOffsetFrames =
+                static_cast<std::uint64_t>(copyStart - sampleStartFrame);
+            const std::uint64_t copyFrames =
+                static_cast<std::uint64_t>(copyEnd - copyStart);
+            const auto* pcm = reinterpret_cast<const std::int16_t*>(bytes);
+            appendResult = resampler.AppendFrames(
+                std::span<const std::int16_t>(
+                    pcm + sourceOffsetFrames * channelCount,
+                    static_cast<std::size_t>(copyFrames * channelCount)),
+                copyFrames,
+                errorMessage);
+            appendedInputFrames = static_cast<std::uint64_t>(copyEnd);
+        }
+        static_cast<void>(buffer->Unlock());
+        if (FAILED(appendResult)) {
+            return appendResult;
+        }
+        if (appendedInputFrames >= targetInputFrames ||
+            sampleTime >= trimEnd) {
+            break;
+        }
+
+        const double fraction = std::clamp(
+            static_cast<double>(sampleTime - trimStart) /
+                static_cast<double>(std::max<LONGLONG>(1, trimEnd - trimStart)),
+            0.0,
+            1.0);
+        ReportProgress(
+            progress,
+            0.80 + fraction * 0.10,
+            L"正在重采样电脑声音…");
+    }
+
+    result = resampler.Finish(errorMessage);
+    if (FAILED(result)) {
+        return result;
+    }
+    if (stopToken.stop_requested()) {
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    }
+    if (!writer.Finalize(writerError, writerNativeError)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = std::move(writerError);
+        }
+        return static_cast<HRESULT>(writerNativeError);
+    }
+    failedOutputCleanup.Release();
+    ReportProgress(progress, 0.91, L"倍速音轨已就绪");
+    return S_OK;
+}
+
 HRESULT ReadVideoFrame(IMFSourceReader* reader, FrameReadResult* output) {
     if (reader == nullptr || output == nullptr) {
         return E_POINTER;
@@ -513,7 +1361,14 @@ HRESULT ExportMp4(
             sampleDuration = nominalDuration;
         }
         sampleDuration = std::min(sampleDuration, trimEnd - frame.timestamp);
-        const LONGLONG outputTimestamp = frame.timestamp - *outputBase;
+        const LONGLONG outputTimestamp = ScaleMediaTicks(
+            frame.timestamp - *outputBase,
+            request.playbackSpeedTenths);
+        const LONGLONG outputDuration = std::max<LONGLONG>(
+            1,
+            ScaleMediaTicks(
+                sampleDuration,
+                request.playbackSpeedTenths));
         if (outputTimestamp <= lastOutputTimestamp) {
             continue;
         }
@@ -528,7 +1383,7 @@ HRESULT ExportMp4(
                 pixels,
                 source.width * 4U,
                 outputTimestamp,
-                std::max<LONGLONG>(1, sampleDuration),
+                outputDuration,
                 writerError,
                 writerNativeError)) {
             if (errorMessage != nullptr) {
@@ -919,9 +1774,12 @@ HRESULT ExportGif(
         if (SUCCEEDED(result)) {
             // GIF 延迟单位是 1/100 秒；用误差扩散交替 6/7 等延迟，避免 15 FPS
             // 全部取 7 导致长片段逐渐变慢。
-            const auto accumulatedDelay = [](const std::uint64_t frameCount, const int fps) {
+            const auto accumulatedDelay = [speedTenths = request.playbackSpeedTenths](
+                                              const std::uint64_t frameCount,
+                                              const int fps) {
                 return static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(frameCount) * 100.0 / static_cast<double>(fps)));
+                    static_cast<double>(frameCount) * 1'000.0 /
+                    (static_cast<double>(fps) * speedTenths)));
             };
             const std::uint64_t delayUnits =
                 accumulatedDelay(writtenFrames + 1, gifFramesPerSecond) -
@@ -996,6 +1854,11 @@ MediaExportResult PrepareCachedArtifact(
         result.errorMessage = L"源录屏路径为空。";
         return result;
     }
+    if (!IsValidPlaybackSpeed(request.playbackSpeedTenths)) {
+        result.nativeError = E_INVALIDARG;
+        result.errorMessage = L"导出倍速必须在 0.1× 到 3.0× 之间。";
+        return result;
+    }
     if (stopToken.stop_requested()) {
         result.cancelled = true;
         result.nativeError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
@@ -1039,8 +1902,14 @@ MediaExportResult PrepareCachedArtifact(
             return result;
         }
 
-        ReportProgress(progress, 0.80, L"正在快速合并电脑声音…");
+        ReportProgress(
+            progress,
+            0.80,
+            request.playbackSpeedTenths == kNormalPlaybackSpeedTenths
+                ? L"正在快速合并电脑声音…"
+                : L"正在生成倍速音轨…");
         AudioVideoMuxResult muxResult{};
+        bool audioRetimed = false;
         const ExportArtifactCacheResult cacheResult =
             ExportArtifactCache::Shared().GetOrCreate(
                 *key,
@@ -1049,13 +1918,45 @@ MediaExportResult PrepareCachedArtifact(
                 [&](const std::filesystem::path& stagingPath,
                     const std::stop_token generationStopToken,
                     std::wstring* generationError) -> HRESULT {
+                    std::filesystem::path muxAudioPath =
+                        request.recording.systemAudio.sourcePath;
+                    std::chrono::milliseconds muxTrimStart = request.trimStart;
+                    std::chrono::milliseconds muxTrimEnd = request.trimEnd;
+                    std::optional<TemporaryFileCleanup> retimedAudioCleanup;
+                    if (request.playbackSpeedTenths !=
+                        kNormalPlaybackSpeedTenths) {
+                        muxAudioPath = TemporarySiblingPath(
+                            stagingPath,
+                            L"speed-audio",
+                            L".m4a");
+                        retimedAudioCleanup.emplace(muxAudioPath);
+                        const HRESULT audioRetimeResult = RetimeAudioSidecar(
+                            request,
+                            muxAudioPath,
+                            progress,
+                            generationStopToken,
+                            generationError);
+                        if (FAILED(audioRetimeResult)) {
+                            return audioRetimeResult;
+                        }
+                        audioRetimed = true;
+                        muxTrimStart = std::chrono::milliseconds(0);
+                        muxTrimEnd = ScaledOutputDuration(request);
+                        if (muxTrimEnd.count() <= 0) {
+                            if (generationError != nullptr) {
+                                *generationError = L"倍速后的音视频时长无效。";
+                            }
+                            return E_INVALIDARG;
+                        }
+                        ReportProgress(progress, 0.92, L"正在快速合并倍速音轨…");
+                    }
                     muxResult = AudioVideoMuxer::Mux(
                         AudioVideoMuxRequest{
                             videoResult.outputPath,
-                            request.recording.systemAudio.sourcePath,
+                            muxAudioPath,
                             stagingPath,
-                            request.trimStart,
-                            request.trimEnd,
+                            muxTrimStart,
+                            muxTrimEnd,
                         },
                         generationStopToken);
                     if (generationError != nullptr) {
@@ -1084,10 +1985,13 @@ MediaExportResult PrepareCachedArtifact(
         result.diagnosticSummary = cacheResult.cacheHit
             ? L"audioMux=true; cacheArtifactValidated=true"
             : std::format(
-                L"audioMux=true; videoDisposition={}; videoCacheHit={}; "
+                L"audioMux=true; audioRetimed={}; speedTenths={}; "
+                L"videoDisposition={}; videoCacheHit={}; "
                 L"videoSamples={}; audioSamples={}; audioLeadingGapNs={}; "
                 L"audioTrailingGapNs={}; droppedLeadingAccessUnit={}; "
                 L"droppedTrailingAccessUnit={}; muxError={}",
+                audioRetimed ? L"true" : L"false",
+                request.playbackSpeedTenths,
                 MediaExporter::DispositionName(videoResult.disposition),
                 videoResult.cacheHit ? L"true" : L"false",
                 muxResult.videoSamples,
@@ -1165,6 +2069,140 @@ MediaExportResult PrepareCachedArtifact(
                     generatedDisposition = MediaExportDisposition::Transcoded;
                     generationDiagnostic = L"generator=GifTranscode";
                     return ExportGif(
+                        request,
+                        stagingPath,
+                        progress,
+                        generationStopToken,
+                        generationError);
+                }
+
+                if (request.playbackSpeedTenths !=
+                    kNormalPlaybackSpeedTenths) {
+                    std::filesystem::path normalSpeedVideoPath =
+                        request.recording.sourcePath;
+                    std::optional<TemporaryFileCleanup> normalSpeedVideoCleanup;
+                    if (!CoversWholeSourceRange(request)) {
+                        normalSpeedVideoPath = TemporarySiblingPath(
+                            stagingPath,
+                            L"normal-speed-video",
+                            L".mp4");
+                        normalSpeedVideoCleanup.emplace(normalSpeedVideoPath);
+                        ReportProgress(
+                            progress,
+                            0.01,
+                            L"正在准备无损倍速视频边界…");
+                        const Mp4BoundaryTrimResult boundaryTrim =
+                            Mp4BoundaryTrimmer::Trim(
+                                request.recording.sourcePath,
+                                normalSpeedVideoPath,
+                                request.trimStart,
+                                request.trimEnd,
+                                generationStopToken);
+                        generationDiagnostic = std::format(
+                            L"speedTenths={}; boundaryTrimOutcome={}; "
+                            L"boundaryTrimHResult=0x{:08X}; "
+                            L"boundaryEncodedFrames={}; "
+                            L"boundaryPassthroughSamples={}; "
+                            L"boundaryDurationNs={}; boundaryScanMs={}; "
+                            L"boundaryDecodeEncodeMs={}; boundaryRemuxMs={}; "
+                            L"boundaryTrimReason={}",
+                            request.playbackSpeedTenths,
+                            BoundaryTrimOutcomeName(boundaryTrim.outcome),
+                            static_cast<std::uint32_t>(boundaryTrim.nativeError),
+                            boundaryTrim.encodedFrames,
+                            boundaryTrim.passthroughSamples,
+                            boundaryTrim.boundaryDuration.count(),
+                            boundaryTrim.scanDuration.count(),
+                            boundaryTrim.decodeEncodeDuration.count(),
+                            boundaryTrim.remuxDuration.count(),
+                            boundaryTrim.errorMessage);
+                        if (boundaryTrim.outcome ==
+                            Mp4BoundaryTrimOutcome::Cancelled) {
+                            if (generationError != nullptr) {
+                                *generationError = boundaryTrim.errorMessage;
+                            }
+                            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                        }
+                        if (boundaryTrim.outcome !=
+                            Mp4BoundaryTrimOutcome::Succeeded) {
+                            ReportProgress(
+                                progress,
+                                0.01,
+                                L"边界直通不可用，正在兼容编码倍速 MP4…");
+                            generatedDisposition =
+                                MediaExportDisposition::Transcoded;
+                            generationDiagnostic +=
+                                L"; compressedRetimeSkipped=true; "
+                                L"fallback=TimestampScaledTranscode";
+                            return ExportMp4(
+                                request,
+                                stagingPath,
+                                progress,
+                                generationStopToken,
+                                generationError);
+                        }
+                    } else {
+                        generationDiagnostic = std::format(
+                            L"speedTenths={}; wholeRangeCompressedSource=true",
+                            request.playbackSpeedTenths);
+                    }
+
+                    ReportProgress(
+                        progress,
+                        0.72,
+                        L"正在无损重定时 H.264 画面…");
+                    const CompressedVideoRetimeResult retimeResult =
+                        AudioVideoMuxer::RetimeCompressedVideo(
+                            CompressedVideoRetimeRequest{
+                                normalSpeedVideoPath,
+                                stagingPath,
+                                request.playbackSpeedTenths,
+                            },
+                            generationStopToken);
+                    generationDiagnostic += std::format(
+                        L"; compressedRetimeOutcome={}; "
+                        L"compressedRetimeHResult=0x{:08X}; "
+                        L"compressedRetimeSamples={}; "
+                        L"compressedRetimeDurationNs={}; "
+                        L"compressedRetimeReason={}",
+                        retimeResult.outcome == AudioVideoMuxOutcome::Succeeded
+                            ? L"Succeeded"
+                            : retimeResult.outcome == AudioVideoMuxOutcome::Unsupported
+                                ? L"Unsupported"
+                                : retimeResult.outcome == AudioVideoMuxOutcome::Cancelled
+                                    ? L"Cancelled"
+                                    : L"Failed",
+                        static_cast<std::uint32_t>(retimeResult.nativeError),
+                        retimeResult.videoSamples,
+                        retimeResult.outputDuration.count(),
+                        retimeResult.errorMessage);
+                    if (retimeResult.outcome ==
+                        AudioVideoMuxOutcome::Succeeded) {
+                        generatedDisposition =
+                            MediaExportDisposition::CompressedRetimedPassthrough;
+                        ReportProgress(progress, 0.96, L"无损倍速画面已就绪");
+                        return S_OK;
+                    }
+                    if (retimeResult.outcome ==
+                        AudioVideoMuxOutcome::Cancelled) {
+                        if (generationError != nullptr) {
+                            *generationError = retimeResult.errorMessage;
+                        }
+                        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                    }
+
+                    std::error_code retimeCleanupError;
+                    std::filesystem::remove(
+                        stagingPath,
+                        retimeCleanupError);
+                    ReportProgress(
+                        progress,
+                        0.01,
+                        L"H.264 压缩域重定时不可用，正在兼容编码…");
+                    generatedDisposition = MediaExportDisposition::Transcoded;
+                    generationDiagnostic +=
+                        L"; fallback=TimestampScaledTranscode";
+                    return ExportMp4(
                         request,
                         stagingPath,
                         progress,
@@ -1268,7 +2306,8 @@ void CompleteDiagnostics(
     const std::wstring error = result->errorMessage;
     result->diagnosticSummary = std::format(
         L"format={}; source={}; trimStartMs={}; trimEndMs={}; "
-        L"recordingDurationMs={}; includeSystemAudio={}; audioSource={}; "
+        L"recordingDurationMs={}; playbackSpeedTenths={}; "
+        L"includeSystemAudio={}; audioSource={}; "
         L"sourceBytes={}; cacheKey={}; cacheHit={}; "
         L"waitedForCacheBuilder={}; cacheBuilderWaitMs={}; "
         L"cacheGenerationMs={}; deliveryMs={}; "
@@ -1279,6 +2318,7 @@ void CompleteDiagnostics(
         request.trimStart.count(),
         request.trimEnd.count(),
         request.recording.duration.count(),
+        request.playbackSpeedTenths,
         request.includeSystemAudio ? L"true" : L"false",
         request.recording.systemAudio.sourcePath.wstring(),
         result->sourceBytes,
@@ -1451,6 +2491,8 @@ std::wstring_view MediaExporter::DispositionName(
         return L"Transcoded";
     case MediaExportDisposition::AudioMuxed:
         return L"AudioMuxed";
+    case MediaExportDisposition::CompressedRetimedPassthrough:
+        return L"CompressedRetimedPassthrough";
     case MediaExportDisposition::BoundaryTrimmedHybrid:
         return L"BoundaryTrimmedHybrid";
     case MediaExportDisposition::SmartTrimmedPassthrough:
@@ -1571,6 +2613,11 @@ MediaExportResult MediaExporter::RunExport(
     if (request.recording.sourcePath.empty() || request.destinationPath.empty()) {
         result.nativeError = E_INVALIDARG;
         result.errorMessage = L"源录屏或导出路径为空。";
+        return result;
+    }
+    if (!IsValidPlaybackSpeed(request.playbackSpeedTenths)) {
+        result.nativeError = E_INVALIDARG;
+        result.errorMessage = L"导出倍速必须在 0.1× 到 3.0× 之间。";
         return result;
     }
     std::error_code fileError;

@@ -7,6 +7,26 @@ namespace qrec::selection::view {
 inline constexpr COLORREF TransparentColor = RGB(255, 0, 255);
 inline constexpr BYTE MaskOpacity = 174;
 
+enum class ControlButton : unsigned char {
+    None,
+    Start,
+    Cancel,
+};
+
+struct ControlLayout final {
+    RECT panel{};
+    RECT startButton{};
+    RECT cancelButton{};
+};
+
+struct SelectionUiState final {
+    bool adjusting{};
+    bool selectionValid{true};
+    ControlButton hoveredButton{ControlButton::None};
+    ControlButton pressedButton{ControlButton::None};
+    RECT activeMonitorBounds{};
+};
+
 // Persistent display-compatible back buffer used by the virtual-desktop
 // selector. A selection update is composed completely off-screen and copied
 // to the layered window in one operation, so the color-key hole and its
@@ -33,6 +53,16 @@ private:
 };
 
 [[nodiscard]] bool IsEmpty(const RECT& rectangle) noexcept;
-void Paint(HWND window, const RECT& selection, UINT dpi, FrameBuffer& frameBuffer);
+[[nodiscard]] ControlLayout CalculateControlLayout(
+    const RECT& client,
+    const RECT& selection,
+    const RECT& activeMonitorBounds,
+    UINT dpi) noexcept;
+void Paint(
+    HWND window,
+    const RECT& selection,
+    UINT dpi,
+    const SelectionUiState& state,
+    FrameBuffer& frameBuffer);
 
 }  // namespace qrec::selection::view

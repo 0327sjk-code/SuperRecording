@@ -51,6 +51,7 @@ private:
         ToggleKeepEditorOpenAfterExport = 1009,
         CheckForUpdates = 1010,
         ApplyDownloadedUpdate = 1011,
+        ToggleAdjustSelectionBeforeRecording = 1012,
     };
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -79,6 +80,7 @@ private:
     void ReconcileStartupAtLaunch();
     void ToggleStartup();
     void ToggleKeepEditorOpenAfterExport();
+    void ToggleAdjustSelectionBeforeRecording();
     void BeginApplyDownloadedUpdate(std::filesystem::path downloadedExecutable);
     void CompleteExit();
     void LogStartupFailure(
@@ -87,6 +89,7 @@ private:
     void ActivateCurrentSurface();
     void RequestExit();
     void Shutdown();
+    void RunStartupMaintenance() noexcept;
 
     [[nodiscard]] std::optional<std::filesystem::path> PrepareRecordingCacheDirectory(
         std::wstring* errorMessage) const;

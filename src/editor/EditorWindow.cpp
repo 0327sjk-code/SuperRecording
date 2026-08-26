@@ -4,6 +4,7 @@
 #include "common/Win32Helpers.h"
 #include "editor/EditorAudioToggle.h"
 #include "editor/EditorChrome.h"
+#include "editor/EditorSpeedControl.h"
 #include "editor/EditorTheme.h"
 #include "editor/EditorTimeFormat.h"
 #include "editor/MediaPreview.h"
@@ -48,6 +49,7 @@ constexpr auto kTimelineSeekPreviewInterval = std::chrono::milliseconds(16);
 constexpr auto kProgressUiInterval = std::chrono::milliseconds(100);
 constexpr UINT kWarmCacheMp4DebounceMilliseconds = 16;
 constexpr UINT kWarmCacheGifDebounceMilliseconds = 350;
+constexpr UINT kWarmCacheSpeedDebounceMilliseconds = 250;
 constexpr UINT_PTR kFormatButtonSubclassId = 0x7201;
 constexpr UINT kExportProgressMessage = WM_APP + 0x231;
 constexpr UINT kExportCompletedMessage = WM_APP + 0x232;
@@ -70,6 +72,12 @@ constexpr int kHeaderTitleId = 1011;
 constexpr int kHeaderSubtitleId = 1012;
 constexpr int kFormatLabelId = 1013;
 constexpr int kAudioToggleId = 1014;
+constexpr int kSpeedControlId = 1015;
+constexpr int kTrimStartButtonId = 1016;
+constexpr int kTrimEndButtonId = 1017;
+
+constexpr wchar_t kTrimStartAccessibleName[] = L"设为起点";
+constexpr wchar_t kTrimEndAccessibleName[] = L"设为终点";
 
 enum class ExportAction : unsigned char {
     Save,
@@ -245,6 +253,9 @@ public:
         trimStart_ = std::chrono::milliseconds(0);
         trimEnd_ = duration_;
         trimRangeEdited_ = false;
+        playbackSpeedTenths_ = EditorSpeedControl::DefaultSpeedTenths;
+        mediaItemReady_ = false;
+        speedInteractionActive_ = false;
         WriteDiagnostic(std::format(
             L"编辑器打开：format=MP4，trimStart={} ms，trimEnd={} ms，duration={} ms，"
             L"recordingDuration={} ms，trimRangeEdited=否",
@@ -272,6 +283,7 @@ public:
         lastTimeLabelDuration_ = std::chrono::milliseconds(-1);
         lastRangeLabelStart_ = std::chrono::milliseconds(-1);
         lastRangeLabelEnd_ = std::chrono::milliseconds(-1);
+        lastRangeLabelSpeedTenths_ = -1;
         timelinePreviewNotificationCount_ = 0;
         timelineCommittedNotificationCount_ = 0;
         previewSeekRequestCount_ = 0;
@@ -538,6 +550,13 @@ private:
                         wParam,
                         lParam);
                 }
+                if (speedControl_.WindowHandle() != nullptr) {
+                    ::SendMessageW(
+                        speedControl_.WindowHandle(),
+                        WM_SETTINGCHANGE,
+                        wParam,
+                        lParam);
+                }
             }
             ApplyEditorDarkTitleBar(window_);
             ::InvalidateRect(window_, nullptr, FALSE);
@@ -664,6 +683,7 @@ private:
             inFlightTimelineSeek_.reset();
             playAfterTimelineSeek_ = false;
             previewVideoRefreshPosted_ = false;
+            mediaItemReady_ = false;
             StopWarmCacheAndWait();
             exporter_.CancelAndWait();
             preview_.Close();
@@ -699,12 +719,25 @@ private:
         headerTitle_ = CreateStatic(L"裁剪与导出", kHeaderTitleId, SS_LEFT | SS_CENTERIMAGE);
         headerSubtitle_ = CreateStatic(L"正在读取录屏信息…", kHeaderSubtitleId, SS_LEFT | SS_CENTERIMAGE);
         rangeText_ = CreateStatic(
-            L"保留片段  00:00.00 — 00:00.00  ·  时长 00:00.00",
+            L"保留  00:00.00 — 00:00.00  ·  输出 00:00.00",
             kRangeTextId,
-            SS_LEFT | SS_CENTERIMAGE);
+            SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS);
         if (!timeline_.Create(window_, kTimelineId, instance_)) {
             return false;
         }
+        if (!speedControl_.Create(
+                window_,
+                kSpeedControlId,
+                instance_,
+                [this](
+                    const int speedTenths,
+                    const EditorSpeedInteractionPhase phase) {
+                    HandleSpeedChanged(speedTenths, phase);
+                })) {
+            return false;
+        }
+        trimStartButton_ = CreateButton(kTrimStartAccessibleName, kTrimStartButtonId);
+        trimEndButton_ = CreateButton(kTrimEndAccessibleName, kTrimEndButtonId);
         playButton_ = CreateButton(L"播放", kPlayButtonId);
         timeText_ = CreateStatic(L"00:00.00 / 00:00.00", kTimeTextId, SS_LEFT | SS_CENTERIMAGE);
         if (!audioToggle_.Create(
@@ -723,6 +756,13 @@ private:
         saveButton_ = CreateButton(L"保存到本地", kSaveButtonId);
         statusText_ = CreateStatic(L"准备就绪", kStatusTextId, SS_LEFT | SS_CENTERIMAGE);
 
+        tooltipWindow_ = CreateTooltipWindow();
+        if (tooltipWindow_ == nullptr ||
+            !AddTooltip(trimStartButton_, L"设为起点") ||
+            !AddTooltip(trimEndButton_, L"设为终点")) {
+            return false;
+        }
+
         if (mp4Radio_ != nullptr) {
             ::SetWindowSubclass(
                 mp4Radio_,
@@ -740,6 +780,7 @@ private:
 
         const std::array controls{
             previewHost_, headerTitle_, headerSubtitle_, rangeText_, timeline_.WindowHandle(),
+            speedControl_.WindowHandle(), trimStartButton_, trimEndButton_,
             playButton_, timeText_, audioToggle_.WindowHandle(), formatLabel_,
             mp4Radio_, gifRadio_, saveButton_,
             copyButton_, statusText_};
@@ -748,9 +789,12 @@ private:
         }
         SetControlFonts();
         timeline_.SetRange(duration_, trimStart_, trimEnd_);
+        timeline_.SetPlayhead(std::chrono::milliseconds::zero());
+        speedControl_.SetValueTenths(playbackSpeedTenths_);
         UpdateTimeLabels(std::chrono::milliseconds(0));
         UpdateHeaderSubtitle();
         RefreshAudioToggleState();
+        UpdateTrimBoundaryButtonStates();
         return true;
     }
 
@@ -771,6 +815,51 @@ private:
             chrome_.AttachButton(button);
         }
         return button;
+    }
+
+    HWND CreateTooltipWindow() const {
+        const HWND tooltip = ::CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            nullptr,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            window_,
+            nullptr,
+            instance_,
+            nullptr);
+        if (tooltip != nullptr) {
+            ::SetWindowPos(
+                tooltip,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            ::SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, Scale(window_, 260));
+        }
+        return tooltip;
+    }
+
+    bool AddTooltip(const HWND control, const wchar_t* text) const {
+        if (tooltipWindow_ == nullptr || control == nullptr || text == nullptr) {
+            return false;
+        }
+        TOOLINFOW information{};
+        information.cbSize = sizeof(information);
+        information.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        information.hwnd = window_;
+        information.uId = reinterpret_cast<UINT_PTR>(control);
+        information.lpszText = const_cast<wchar_t*>(text);
+        return ::SendMessageW(
+            tooltipWindow_,
+            TTM_ADDTOOLW,
+            0,
+            reinterpret_cast<LPARAM>(&information)) != FALSE;
     }
 
     static LRESULT CALLBACK FormatButtonSubclassProc(
@@ -823,6 +912,8 @@ private:
         SetControlFont(headerSubtitle_, chrome_.CaptionFont());
         SetControlFont(rangeText_, chrome_.RegularFont());
         SetControlFont(timeline_.WindowHandle(), chrome_.CaptionFont());
+        SetControlFont(trimStartButton_, chrome_.RegularFont());
+        SetControlFont(trimEndButton_, chrome_.RegularFont());
         SetControlFont(playButton_, chrome_.RegularFont());
         SetControlFont(timeText_, chrome_.TimeFont());
         SetControlFont(formatLabel_, chrome_.RegularFont());
@@ -834,6 +925,10 @@ private:
     }
 
     void DeleteUiResources() noexcept {
+        if (tooltipWindow_ != nullptr && ::IsWindow(tooltipWindow_) != FALSE) {
+            ::DestroyWindow(tooltipWindow_);
+        }
+        tooltipWindow_ = nullptr;
         chrome_.Destroy();
     }
 
@@ -858,6 +953,9 @@ private:
             Placement{headerSubtitle_, &layout.headerSubtitle},
             Placement{previewHost_, &layout.preview},
             Placement{rangeText_, &layout.rangeLabel},
+            Placement{speedControl_.WindowHandle(), &layout.speedControl},
+            Placement{trimStartButton_, &layout.trimStartButton},
+            Placement{trimEndButton_, &layout.trimEndButton},
             Placement{timeline_.WindowHandle(), &layout.timeline},
             Placement{playButton_, &layout.playButton},
             Placement{timeText_, &layout.timeLabel},
@@ -969,6 +1067,12 @@ private:
         case kPlayButtonId:
             state.role = EditorButtonRole::Play;
             break;
+        case kTrimStartButtonId:
+            state.role = EditorButtonRole::TrimStart;
+            break;
+        case kTrimEndButtonId:
+            state.role = EditorButtonRole::TrimEnd;
+            break;
         case kMp4RadioId:
             state.role = EditorButtonRole::SegmentLeft;
             state.selected = selectedFormat_ == OutputFormat::Mp4;
@@ -1017,6 +1121,12 @@ private:
         case kPlayButtonId:
             TogglePlayback();
             break;
+        case kTrimStartButtonId:
+            SetTrimBoundaryFromPlayhead(true);
+            break;
+        case kTrimEndButtonId:
+            SetTrimBoundaryFromPlayhead(false);
+            break;
         case kMp4RadioId:
             ChangeFormat(OutputFormat::Mp4);
             break;
@@ -1063,12 +1173,150 @@ private:
         }
     }
 
+    [[nodiscard]] std::chrono::milliseconds MinimumTrimSpan() const noexcept {
+        return std::min(duration_, std::chrono::milliseconds(100));
+    }
+
+    [[nodiscard]] std::chrono::milliseconds QuantizedPlayhead() const noexcept {
+        const int framesPerSecond = std::max(1, recording_.framesPerSecond);
+        const auto playhead = std::clamp(
+            timeline_.Playhead(),
+            std::chrono::milliseconds::zero(),
+            duration_);
+        const long double frame = std::round(
+            static_cast<long double>(playhead.count()) * framesPerSecond / 1000.0L);
+        const auto quantizedMilliseconds = static_cast<std::int64_t>(std::llround(
+            frame * 1000.0L / static_cast<long double>(framesPerSecond)));
+        return std::clamp(
+            std::chrono::milliseconds(quantizedMilliseconds),
+            std::chrono::milliseconds::zero(),
+            duration_);
+    }
+
+    [[nodiscard]] bool CanSetTrimStartFromPlayhead() const noexcept {
+        return QuantizedPlayhead() <= trimEnd_ - MinimumTrimSpan();
+    }
+
+    [[nodiscard]] bool CanSetTrimEndFromPlayhead() const noexcept {
+        return QuantizedPlayhead() >= trimStart_ + MinimumTrimSpan();
+    }
+
+    void UpdateTrimBoundaryButtonStates() {
+        const bool startEnabled = !busy_ && CanSetTrimStartFromPlayhead();
+        const bool endEnabled = !busy_ && CanSetTrimEndFromPlayhead();
+        if (trimStartButton_ != nullptr &&
+            (::IsWindowEnabled(trimStartButton_) != FALSE) != startEnabled) {
+            ::EnableWindow(trimStartButton_, startEnabled ? TRUE : FALSE);
+        }
+        if (trimEndButton_ != nullptr &&
+            (::IsWindowEnabled(trimEndButton_) != FALSE) != endEnabled) {
+            ::EnableWindow(trimEndButton_, endEnabled ? TRUE : FALSE);
+        }
+    }
+
+    void SetTrimBoundaryFromPlayhead(const bool setStart) {
+        if (busy_) {
+            return;
+        }
+        const auto position = QuantizedPlayhead();
+        const bool valid = setStart
+            ? CanSetTrimStartFromPlayhead()
+            : CanSetTrimEndFromPlayhead();
+        if (!valid) {
+            UpdateTrimBoundaryButtonStates();
+            return;
+        }
+        const bool changed = setStart
+            ? timeline_.CommitTrimStart(position)
+            : timeline_.CommitTrimEnd(position);
+        UpdateTrimBoundaryButtonStates();
+        if (changed) {
+            WriteDiagnostic(std::format(
+                L"编辑器快速定界：boundary={}，playhead={} ms，fps={}，"
+                L"quantized={} ms",
+                setStart ? L"起点" : L"终点",
+                timeline_.Playhead().count(),
+                std::max(1, recording_.framesPerSecond),
+                position.count()));
+        }
+    }
+
+    void ApplyPreviewSpeed() {
+        std::wstring error;
+        if (!mediaItemReady_) {
+            static_cast<void>(preview_.SetPlaybackSpeedTenths(
+                playbackSpeedTenths_,
+                nullptr));
+            return;
+        }
+        if (!preview_.SetPlaybackSpeedTenths(playbackSpeedTenths_, &error)) {
+            WriteDiagnostic(std::format(
+                L"编辑器预览倍速设置失败：speed={:.1f}x，error={}",
+                playbackSpeedTenths_ / 10.0,
+                error));
+            if (!busy_) {
+                SetStatus(
+                    error.empty() ? L"当前视频无法按所选倍速预览。" : error,
+                    EditorStatusTone::Error);
+            }
+        }
+    }
+
+    void HandleSpeedChanged(
+        const int speedTenths,
+        const EditorSpeedInteractionPhase phase) {
+        if (busy_) {
+            speedControl_.SetValueTenths(playbackSpeedTenths_);
+            return;
+        }
+        const int clamped = std::clamp(
+            speedTenths,
+            EditorSpeedControl::MinimumSpeedTenths,
+            EditorSpeedControl::MaximumSpeedTenths);
+        const bool valueChanged = playbackSpeedTenths_ != clamped;
+        playbackSpeedTenths_ = clamped;
+        speedControl_.SetValueTenths(playbackSpeedTenths_);
+        if (valueChanged) {
+            lastRangeLabelSpeedTenths_ = -1;
+            UpdateTimeLabels(timeline_.Playhead());
+            ApplyPreviewSpeed();
+            if (playing_) {
+                // The playback-end guard is polled only while playing. Re-arm
+                // it immediately so a faster rate cannot keep the previous
+                // 16 ms cadence until the next play/pause transition.
+                StopPlaybackUiTimer();
+                StartPlaybackUiTimer();
+            }
+        }
+
+        if (phase == EditorSpeedInteractionPhase::Preview) {
+            if (!speedInteractionActive_) {
+                speedInteractionActive_ = true;
+                InvalidateWarmCacheWork();
+            }
+            UpdateReadyStatus();
+            return;
+        }
+
+        speedInteractionActive_ = false;
+        WriteDiagnostic(std::format(
+            L"编辑器倍速提交：speed={:.1f}x，trimStart={} ms，trimEnd={} ms，"
+            L"format={}，includeSystemAudio={}",
+            playbackSpeedTenths_ / 10.0,
+            trimStart_.count(),
+            trimEnd_.count(),
+            OutputFormatName(selectedFormat_),
+            ShouldIncludeSystemAudio() ? L"是" : L"否"));
+        ScheduleWarmCache(kWarmCacheSpeedDebounceMilliseconds);
+    }
+
     void HandleTimelineNotification(const TimelineNotification& notification) {
         const bool committed =
             notification.phase == TimelineInteractionPhase::Committed;
         if (notification.header.code == TimelineRangeChanged) {
             trimStart_ = notification.trimStart;
             trimEnd_ = notification.trimEnd;
+            UpdateTrimBoundaryButtonStates();
             bool invalidatedPreparedArtifact = false;
             if (!committed && !timelineRangeInteractionActive_) {
                 invalidatedPreparedArtifact = warmCacheReady_ || warmCacheInProgress_;
@@ -1101,8 +1349,11 @@ private:
             }
         } else if (notification.header.code == TimelineSeekRequested) {
             const auto position = std::clamp(
-                notification.seekPosition, trimStart_, trimEnd_);
+                notification.seekPosition,
+                std::chrono::milliseconds::zero(),
+                duration_);
             timeline_.SetPlayhead(position);
+            UpdateTrimBoundaryButtonStates();
             UpdateTimelineLabels(position, committed);
             QueueTimelineSeek(position, committed);
             if (committed) {
@@ -1116,7 +1367,10 @@ private:
     void QueueTimelineSeek(
         const std::chrono::milliseconds position,
         const bool finalCommit = false) {
-        const auto clamped = std::clamp(position, trimStart_, trimEnd_);
+        const auto clamped = std::clamp(
+            position,
+            std::chrono::milliseconds::zero(),
+            duration_);
         awaitingNaturalPlaybackEnd_ = false;
         ++previewSeekRequestCount_;
         if (pendingTimelineSeek_.has_value() || previewSeekInFlight_) {
@@ -1217,6 +1471,11 @@ private:
             StopPlaybackUiTimer();
         } else {
             if (pendingTimelineSeek_.has_value() || previewSeekInFlight_) {
+                const auto pendingPosition = pendingTimelineSeek_.value_or(
+                    inFlightTimelineSeek_.value_or(preview_.Position()));
+                if (pendingPosition < trimStart_ || pendingPosition >= trimEnd_) {
+                    QueueTimelineSeek(trimStart_, true);
+                }
                 pendingTimelineSeekFinal_ = true;
                 playAfterTimelineSeek_ = true;
                 playing_ = true;
@@ -1255,8 +1514,49 @@ private:
         playbackTimerArmed_ = ::SetTimer(
             window_,
             kPlaybackTimer,
-            kPlaybackRefreshMilliseconds,
+            PlaybackRefreshIntervalMilliseconds(),
             nullptr) != 0;
+    }
+
+    [[nodiscard]] UINT PlaybackRefreshIntervalMilliseconds() const noexcept {
+        const auto framesPerSecond = static_cast<std::uint64_t>(
+            std::max(1, recording_.framesPerSecond));
+        const auto speedTenths = static_cast<std::uint64_t>(
+            std::clamp(
+                playbackSpeedTenths_,
+                EditorSpeedControl::MinimumSpeedTenths,
+                EditorSpeedControl::MaximumSpeedTenths));
+        // One UI poll should advance by no more than roughly one source frame.
+        // Slower rates retain the existing 16 ms ceiling for smooth UI updates.
+        const auto frameBoundedInterval = std::max<std::uint64_t>(
+            1,
+            10'000ULL / (framesPerSecond * speedTenths));
+        return static_cast<UINT>(std::min<std::uint64_t>(
+            kPlaybackRefreshMilliseconds,
+            frameBoundedInterval));
+    }
+
+    [[nodiscard]] std::chrono::milliseconds PlaybackEndGuard() const noexcept {
+        if (playbackSpeedTenths_ <= EditorSpeedControl::DefaultSpeedTenths) {
+            return std::chrono::milliseconds::zero();
+        }
+        const long double framesPerSecond = static_cast<long double>(
+            std::max(1, recording_.framesPerSecond));
+        const long double sourceFrameMilliseconds = 1000.0L / framesPerSecond;
+        // SetTimer clamps sub-USER_TIMER_MINIMUM requests. Compensate only for
+        // the source-time advance beyond one frame, avoiding a full-frame early
+        // stop at rates whose requested cadence is already sufficient.
+        const UINT effectiveInterval = std::max<UINT>(
+            PlaybackRefreshIntervalMilliseconds(),
+            USER_TIMER_MINIMUM);
+        const long double sourceAdvanceMilliseconds =
+            static_cast<long double>(effectiveInterval) *
+            static_cast<long double>(playbackSpeedTenths_) / 10.0L;
+        const long double guardMilliseconds = std::max<long double>(
+            0.0L,
+            sourceAdvanceMilliseconds - sourceFrameMilliseconds);
+        return std::chrono::milliseconds(static_cast<std::int64_t>(
+            std::ceil(guardMilliseconds)));
     }
 
     void StopPlaybackUiTimer() noexcept {
@@ -1298,18 +1598,22 @@ private:
             return;
         }
         const auto position = preview_.Position();
-        if (position >= trimEnd_) {
+        const auto endGuard = PlaybackEndGuard();
+        const auto guardedEnd = std::max(trimStart_, trimEnd_ - endGuard);
+        if (position >= guardedEnd) {
             awaitingNaturalPlaybackEnd_ = false;
             static_cast<void>(preview_.Pause());
             playing_ = false;
             StopPlaybackUiTimer();
             timeline_.SetPlayhead(trimStart_);
+            UpdateTrimBoundaryButtonStates();
             UpdateTimeLabels(trimStart_);
             UpdatePlayButton();
             QueueTimelineSeek(trimStart_, true);
             return;
         }
         timeline_.SetPlayhead(position);
+        UpdateTrimBoundaryButtonStates();
         const auto now = std::chrono::steady_clock::now();
         if (lastPlaybackTextRefresh_ == std::chrono::steady_clock::time_point{} ||
             now - lastPlaybackTextRefresh_ >= kPlaybackTextRefreshInterval) {
@@ -1332,14 +1636,21 @@ private:
                 ::SetWindowTextW(timeText_, timeText.c_str());
             }
         }
-        if (trimStart_ != lastRangeLabelStart_ || trimEnd_ != lastRangeLabelEnd_) {
+        if (trimStart_ != lastRangeLabelStart_ || trimEnd_ != lastRangeLabelEnd_ ||
+            playbackSpeedTenths_ != lastRangeLabelSpeedTenths_) {
             lastRangeLabelStart_ = trimStart_;
             lastRangeLabelEnd_ = trimEnd_;
+            lastRangeLabelSpeedTenths_ = playbackSpeedTenths_;
+            const auto retainedDuration = trimEnd_ - trimStart_;
+            const auto outputDuration = std::chrono::milliseconds(
+                static_cast<std::int64_t>(std::llround(
+                    static_cast<long double>(retainedDuration.count()) * 10.0L /
+                    static_cast<long double>(std::max(1, playbackSpeedTenths_)))));
             const std::wstring rangeText = std::format(
-                L"保留片段  {} — {}  ·  时长 {}",
+                L"保留  {} — {}  ·  输出 {}",
                 FormatEditorTime(trimStart_),
                 FormatEditorTime(trimEnd_),
-                FormatEditorTime(trimEnd_ - trimStart_));
+                FormatEditorTime(outputDuration));
             if (displayedRangeText_ != rangeText) {
                 displayedRangeText_ = rangeText;
                 ::SetWindowTextW(rangeText_, rangeText.c_str());
@@ -1418,15 +1729,21 @@ private:
         }
         if (NeedsWarmCache() && warmCacheInProgress_) {
             SetStatus(
-                ShouldIncludeSystemAudio()
+                playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
+                    ? L"正在后台准备倍速成片，可继续预览"
+                    : (ShouldIncludeSystemAudio()
                     ? L"正在后台快速合并电脑声音，可继续编辑"
-                    : L"正在后台准备，可继续预览",
+                    : L"正在后台准备，可继续预览"),
                 EditorStatusTone::Progress);
             return;
         }
         if (selectedFormat_ == OutputFormat::Gif) {
             SetStatus(
                 L"GIF 需要重新生成；耗时取决于片段长度",
+                EditorStatusTone::Neutral);
+        } else if (playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths) {
+            SetStatus(
+                L"倍速成片将在后台准备；可继续预览和裁剪",
                 EditorStatusTone::Neutral);
         } else if (ShouldIncludeSystemAudio()) {
             SetStatus(
@@ -1455,6 +1772,7 @@ private:
         }
         switch (type) {
         case MFP_EVENT_TYPE_MEDIAITEM_SET: {
+            mediaItemReady_ = true;
             const auto detectedDuration = preview_.Duration();
             if (detectedDuration.count() > 0) {
                 duration_ = detectedDuration;
@@ -1462,6 +1780,8 @@ private:
                 trimEnd_ = duration_;
                 trimRangeEdited_ = false;
                 timeline_.SetRange(duration_, trimStart_, trimEnd_);
+                timeline_.SetPlayhead(std::chrono::milliseconds::zero());
+                UpdateTrimBoundaryButtonStates();
                 UpdateTimeLabels(std::chrono::milliseconds(0));
                 UpdateHeaderSubtitle();
                 WriteDiagnostic(std::format(
@@ -1473,6 +1793,7 @@ private:
                     OutputFormatName(selectedFormat_)));
                 ScheduleWarmCache();
             }
+            ApplyPreviewSpeed();
             preview_.UpdateVideo();
             std::wstring playError;
             if (preview_.Play(&playError)) {
@@ -1504,6 +1825,7 @@ private:
             playing_ = false;
             StopPlaybackUiTimer();
             timeline_.SetPlayhead(trimStart_);
+            UpdateTrimBoundaryButtonStates();
             UpdateTimeLabels(trimStart_);
             UpdatePlayButton();
             QueueTimelineSeek(trimStart_, true);
@@ -1635,13 +1957,15 @@ private:
         request.trimEnd = trimRangeEdited_ ? trimEnd_ : recording_.duration;
         request.format = selectedFormat_;
         request.includeSystemAudio = ShouldIncludeSystemAudio();
+        request.playbackSpeedTenths = playbackSpeedTenths_;
         request.destinationPath = destination;
         return request;
     }
 
     [[nodiscard]] bool NeedsWarmCache() const noexcept {
         return selectedFormat_ == OutputFormat::Gif || trimRangeEdited_ ||
-            ShouldIncludeSystemAudio();
+            ShouldIncludeSystemAudio() ||
+            playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths;
     }
 
     void ClearPendingWarmCacheMessages() {
@@ -1726,7 +2050,8 @@ private:
         }
     }
 
-    void ScheduleWarmCache() {
+    void ScheduleWarmCache(
+        const std::optional<UINT> debounceMilliseconds = std::nullopt) {
         InvalidateWarmCacheWork();
         if (!NeedsWarmCache()) {
             if (!busy_) {
@@ -1742,9 +2067,10 @@ private:
         warmCacheDebounceArmed_ = ::SetTimer(
             window_,
             kWarmCacheDebounceTimer,
-            selectedFormat_ == OutputFormat::Mp4
-                ? kWarmCacheMp4DebounceMilliseconds
-                : kWarmCacheGifDebounceMilliseconds,
+            debounceMilliseconds.value_or(
+                selectedFormat_ == OutputFormat::Mp4
+                    ? kWarmCacheMp4DebounceMilliseconds
+                    : kWarmCacheGifDebounceMilliseconds),
             nullptr) != 0;
         if (!warmCacheDebounceArmed_) {
             StartWarmCache();
@@ -1777,7 +2103,7 @@ private:
         }
         WriteDiagnostic(std::format(
             L"后台预生成请求：generation={}，format={}，trimStart={} ms，trimEnd={} ms，"
-            L"duration={} ms，trimRangeEdited={}，includeSystemAudio={}，"
+            L"duration={} ms，trimRangeEdited={}，includeSystemAudio={}，speed={:.1f}x，"
             L"requestStart={} ms，requestEnd={} ms",
             generation,
             OutputFormatName(request.format),
@@ -1786,6 +2112,7 @@ private:
             duration_.count(),
             trimRangeEdited_ ? L"是" : L"否",
             request.includeSystemAudio ? L"是" : L"否",
+            request.playbackSpeedTenths / 10.0,
             request.trimStart.count(),
             request.trimEnd.count()));
         if (!warmCacheCoordinator_.Submit(generation, std::move(request))) {
@@ -1822,8 +2149,16 @@ private:
         if (!busy_) {
             const int percentage = static_cast<int>(std::lround(
                 std::clamp(state->progress.fraction, 0.0, 1.0) * 100.0));
+            const std::wstring progressText =
+                playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
+                ? std::format(
+                    L"正在后台准备倍速成片，可继续预览  {}%",
+                    percentage)
+                : std::format(
+                    L"正在后台准备，可继续预览  {}%",
+                    percentage);
             SetStatus(
-                std::format(L"正在后台准备，可继续预览  {}%", percentage),
+                progressText,
                 EditorStatusTone::Progress);
         }
     }
@@ -1909,7 +2244,7 @@ private:
         WriteDiagnostic(std::format(
             L"编辑器导出请求：action={}，format={}，trimStart={} ms，trimEnd={} ms，"
             L"duration={} ms，trimRangeEdited={}，requestStart={} ms，requestEnd={} ms，"
-            L"recordingDuration={} ms，includeSystemAudio={}，mode={}，source={}，"
+            L"recordingDuration={} ms，includeSystemAudio={}，speed={:.1f}x，mode={}，source={}，"
             L"audioSource={}，destination={}",
             ExportActionName(action),
             OutputFormatName(request.format),
@@ -1921,6 +2256,7 @@ private:
             request.trimEnd.count(),
             request.recording.duration.count(),
             request.includeSystemAudio ? L"是" : L"否",
+            request.playbackSpeedTenths / 10.0,
             passthrough ? L"原片直通" : L"重新生成媒体",
             request.recording.sourcePath.wstring(),
             request.recording.systemAudio.sourcePath.wstring(),
@@ -1945,6 +2281,12 @@ private:
                 currentExportAction_ == ExportAction::Copy
                     ? L"正在生成 GIF，完成后将复制到剪贴板…"
                     : L"正在生成 GIF，完成后将保存到本地…",
+                EditorStatusTone::Progress);
+        } else if (playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths) {
+            SetStatus(
+                currentExportAction_ == ExportAction::Copy
+                    ? L"正在生成倍速 MP4，完成后将复制到剪贴板…"
+                    : L"正在生成倍速 MP4，完成后将保存到本地…",
                 EditorStatusTone::Progress);
         } else if (currentExportSystemAudio_) {
             SetStatus(
@@ -2148,11 +2490,13 @@ private:
     void SetBusy(const bool busy) {
         busy_ = busy;
         timeline_.SetEnabled(!busy);
+        speedControl_.SetEnabled(!busy);
         const std::array controls{
             playButton_, mp4Radio_, gifRadio_, saveButton_, copyButton_};
         for (const HWND control : controls) {
             ::EnableWindow(control, busy ? FALSE : TRUE);
         }
+        UpdateTrimBoundaryButtonStates();
         RefreshAudioToggleState();
         const wchar_t* saveLabel = L"保存到本地";
         const wchar_t* copyLabel = L"复制到剪贴板";
@@ -2332,6 +2676,9 @@ private:
     HWND previewHost_{};
     HWND headerTitle_{};
     HWND headerSubtitle_{};
+    HWND tooltipWindow_{};
+    HWND trimStartButton_{};
+    HWND trimEndButton_{};
     HWND playButton_{};
     HWND timeText_{};
     HWND rangeText_{};
@@ -2348,6 +2695,7 @@ private:
 
     EditorChrome chrome_;
     TrimTimeline timeline_;
+    EditorSpeedControl speedControl_;
     EditorAudioToggle audioToggle_;
     MediaPreview preview_;
     MediaExporter exporter_;
@@ -2368,6 +2716,7 @@ private:
     std::chrono::milliseconds duration_{1};
     std::chrono::milliseconds trimStart_{};
     std::chrono::milliseconds trimEnd_{1};
+    int playbackSpeedTenths_{EditorSpeedControl::DefaultSpeedTenths};
     bool trimRangeEdited_{};
     bool playing_{};
     bool busy_{};
@@ -2385,6 +2734,7 @@ private:
     std::chrono::milliseconds lastTimeLabelDuration_{-1};
     std::chrono::milliseconds lastRangeLabelStart_{-1};
     std::chrono::milliseconds lastRangeLabelEnd_{-1};
+    int lastRangeLabelSpeedTenths_{-1};
     bool playbackTimerArmed_{};
     bool timelineSeekTimerArmed_{};
     bool timelineInteractionTimerArmed_{};
@@ -2394,6 +2744,8 @@ private:
     bool playAfterTimelineSeek_{};
     bool awaitingNaturalPlaybackEnd_{};
     bool timelineRangeInteractionActive_{};
+    bool speedInteractionActive_{};
+    bool mediaItemReady_{};
     bool previewVideoRefreshPosted_{};
     std::uint64_t timelinePreviewNotificationCount_{};
     std::uint64_t timelineCommittedNotificationCount_{};

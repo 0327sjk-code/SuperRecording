@@ -41,6 +41,7 @@ struct AppSettings final {
     OutputFormat defaultFormat{OutputFormat::Mp4};
     bool includeCursor{true};
     bool keepEditorOpenAfterExport{true};
+    bool adjustSelectionBeforeRecording{false};
 };
 
 struct RecordingStats final {
@@ -74,6 +75,7 @@ struct ExportRequest final {
     std::chrono::milliseconds trimEnd{};
     OutputFormat format{OutputFormat::Mp4};
     bool includeSystemAudio{};
+    int playbackSpeedTenths{10};
     std::filesystem::path destinationPath;
 };
 

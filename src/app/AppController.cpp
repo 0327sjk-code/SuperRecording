@@ -153,24 +153,6 @@ bool AppController::Initialize() {
         logger_.Error(
             L"录制快捷键配置写入失败：" + configStore_.FilePath().wstring());
     }
-    std::wstring directoryError;
-    if (!win32::EnsureDirectory(settings_.saveDirectory, &directoryError)) {
-        settings_.saveDirectory = win32::DefaultVideoDirectory();
-        static_cast<void>(win32::EnsureDirectory(settings_.saveDirectory, nullptr));
-    }
-    const CacheCleanupReport cleanup = CacheMaintenance::Cleanup(settings_.saveDirectory);
-    if (cleanup.removedFiles > 0) {
-        logger_.Info(std::format(
-            L"已清理 {} 个过期录屏缓存目录项，涉及文件大小 {} 字节。",
-            cleanup.removedFiles,
-            cleanup.releasedBytes));
-    }
-    if (cleanup.failures > 0) {
-        logger_.Error(std::format(
-            L"录屏缓存清理有 {} 个文件无法检查或删除；程序将继续运行。",
-            cleanup.failures));
-    }
-
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
     ::InitCommonControlsEx(&controls);
 
@@ -257,11 +239,14 @@ bool AppController::Initialize() {
             NIIF_INFO);
     }
     ReconcileStartupAtLaunch();
-    logger_.Info(L"应用启动，保存位置：" + settings_.saveDirectory.wstring());
     return true;
 }
 
 int AppController::Run() {
+    // Update health is signalled after Initialize() and before Run(). Keep all
+    // potentially unbounded user-path I/O outside that rollback-critical gate.
+    RunStartupMaintenance();
+
     MSG message{};
     while (true) {
         const BOOL result = ::GetMessageW(&message, nullptr, 0, 0);
@@ -302,6 +287,42 @@ int AppController::Run() {
         }
         ::TranslateMessage(&message);
         ::DispatchMessageW(&message);
+    }
+}
+
+void AppController::RunStartupMaintenance() noexcept {
+    try {
+        std::wstring directoryError;
+        if (!win32::EnsureDirectory(settings_.saveDirectory, &directoryError)) {
+            logger_.Error(
+                L"无法访问配置的保存位置，将使用默认视频目录：" +
+                directoryError);
+            settings_.saveDirectory = win32::DefaultVideoDirectory();
+            static_cast<void>(
+                win32::EnsureDirectory(settings_.saveDirectory, nullptr));
+        }
+
+        const CacheCleanupReport cleanup =
+            CacheMaintenance::Cleanup(settings_.saveDirectory);
+        if (cleanup.removedFiles > 0) {
+            logger_.Info(std::format(
+                L"已清理 {} 个过期录屏缓存目录项，涉及文件大小 {} 字节。",
+                cleanup.removedFiles,
+                cleanup.releasedBytes));
+        }
+        if (cleanup.failures > 0) {
+            logger_.Error(std::format(
+                L"录屏缓存清理有 {} 个文件无法检查或删除；程序将继续运行。",
+                cleanup.failures));
+        }
+        logger_.Info(
+            L"应用启动，保存位置：" + settings_.saveDirectory.wstring());
+    } catch (...) {
+        try {
+            logger_.Error(
+                L"启动维护任务执行失败；录屏功能将继续使用当前配置。");
+        } catch (...) {
+        }
     }
 }
 
@@ -443,7 +464,9 @@ void AppController::StartSelection() {
     }
 
     state_ = RecordingState::Selecting;
-    const std::optional<IntRect> selected = selector_.Select(window_);
+    const std::optional<IntRect> selected = selector_.Select(
+        window_,
+        settings_.adjustSelectionBeforeRecording);
     if (shuttingDown_) {
         return;
     }
@@ -695,7 +718,14 @@ void AppController::OpenEditor(RecordingResult result) {
     editor_ = std::make_unique<EditorWindow>(instance_, window_);
     EditorWindowCallbacks callbacks;
     callbacks.settingsChanged = [this](const AppSettings& updated) {
+        // The selector workflow is owned by the tray and can change while an
+        // editor holding an older settings snapshot is open. Never let an
+        // editor callback roll that persisted choice back.
+        const bool adjustSelectionBeforeRecording =
+            settings_.adjustSelectionBeforeRecording;
         settings_ = updated;
+        settings_.adjustSelectionBeforeRecording =
+            adjustSelectionBeforeRecording;
         SaveSettings();
     };
     callbacks.exportCompleted = [this](const EditorExportResult& exportResult) {
@@ -801,6 +831,12 @@ void AppController::ShowTrayMenu() {
 
     ::AppendMenuW(
         menu,
+        MF_STRING | (settings_.adjustSelectionBeforeRecording ? MF_CHECKED : 0),
+        static_cast<UINT>(MenuCommand::ToggleAdjustSelectionBeforeRecording),
+        L"框选后调整选区");
+
+    ::AppendMenuW(
+        menu,
         MF_STRING | (settings_.keepEditorOpenAfterExport ? MF_CHECKED : 0),
         static_cast<UINT>(MenuCommand::ToggleKeepEditorOpenAfterExport),
         L"导出后保留编辑窗口");
@@ -873,6 +909,9 @@ void AppController::HandleMenu(const MenuCommand command) {
         break;
     case MenuCommand::ToggleKeepEditorOpenAfterExport:
         ToggleKeepEditorOpenAfterExport();
+        break;
+    case MenuCommand::ToggleAdjustSelectionBeforeRecording:
+        ToggleAdjustSelectionBeforeRecording();
         break;
     case MenuCommand::SetSaveDirectory:
         ChooseSaveDirectory();
@@ -1059,6 +1098,26 @@ void AppController::ToggleKeepEditorOpenAfterExport() {
         requestedValue
             ? L"已启用导出后保留编辑窗口。"
             : L"已关闭导出后保留编辑窗口；后续成功导出将自动关闭编辑窗口。");
+}
+
+void AppController::ToggleAdjustSelectionBeforeRecording() {
+    const bool requestedValue = !settings_.adjustSelectionBeforeRecording;
+    if (!configStore_.SaveAdjustSelectionBeforeRecording(requestedValue)) {
+        logger_.Error(
+            L"框选后调整选区设置保存失败，已保持原设置：" +
+            configStore_.FilePath().wstring());
+        trayIcon_.ShowNotification(
+            L"设置未保存",
+            L"无法写入 SuperRecording 配置文件，原设置保持不变。",
+            NIIF_WARNING);
+        return;
+    }
+
+    settings_.adjustSelectionBeforeRecording = requestedValue;
+    logger_.Info(
+        requestedValue
+            ? L"已启用框选后调整选区；下次框选将在确认后开始录制。"
+            : L"已关闭框选后调整选区；下次松开鼠标后立即开始录制。");
 }
 
 void AppController::BeginApplyDownloadedUpdate(

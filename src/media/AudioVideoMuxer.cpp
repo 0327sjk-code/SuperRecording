@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <string_view>
@@ -861,6 +862,331 @@ struct AudioReadState final {
 }
 
 }  // namespace
+
+CompressedVideoRetimeResult AudioVideoMuxer::RetimeCompressedVideo(
+    const CompressedVideoRetimeRequest& request,
+    const std::stop_token stopToken) noexcept {
+    CompressedVideoRetimeResult retimeResult{};
+    try {
+        if (request.sourcePath.empty() || request.destinationPath.empty() ||
+            request.playbackSpeedTenths < 1 ||
+            request.playbackSpeedTenths > 30) {
+            retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+            retimeResult.nativeError = E_INVALIDARG;
+            retimeResult.errorMessage = L"H.264 重定时参数无效。";
+            return retimeResult;
+        }
+        if (stopToken.stop_requested()) {
+            retimeResult.outcome = AudioVideoMuxOutcome::Cancelled;
+            retimeResult.nativeError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            return retimeResult;
+        }
+
+        std::error_code pathError;
+        const std::filesystem::path sourcePath = std::filesystem::absolute(
+            request.sourcePath,
+            pathError).lexically_normal();
+        if (pathError ||
+            !std::filesystem::is_regular_file(sourcePath, pathError) ||
+            pathError) {
+            retimeResult.nativeError = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+            retimeResult.errorMessage = L"H.264 重定时源文件不存在。";
+            return retimeResult;
+        }
+        pathError.clear();
+        const std::filesystem::path destinationPath = std::filesystem::absolute(
+            request.destinationPath,
+            pathError).lexically_normal();
+        if (pathError ||
+            _wcsicmp(sourcePath.c_str(), destinationPath.c_str()) == 0) {
+            retimeResult.nativeError = E_INVALIDARG;
+            retimeResult.errorMessage = L"H.264 重定时不能覆盖源文件。";
+            return retimeResult;
+        }
+        if (::GetFileAttributesW(destinationPath.c_str()) !=
+            INVALID_FILE_ATTRIBUTES) {
+            retimeResult.nativeError = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+            retimeResult.errorMessage = L"H.264 重定时目标文件已存在。";
+            return retimeResult;
+        }
+
+        const std::filesystem::path parent = destinationPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, pathError);
+            if (pathError) {
+                retimeResult.nativeError = HRESULT_FROM_WIN32(
+                    static_cast<DWORD>(pathError.value()));
+                retimeResult.errorMessage = L"无法创建 H.264 重定时输出目录。";
+                return retimeResult;
+            }
+        }
+
+        const win32::ScopedCoInitialize apartment(COINIT_MULTITHREADED);
+        if (FAILED(apartment.Result()) &&
+            apartment.Result() != RPC_E_CHANGED_MODE) {
+            retimeResult.nativeError = apartment.Result();
+            retimeResult.errorMessage = ErrorText(
+                L"初始化 H.264 重定时 COM 线程失败",
+                apartment.Result());
+            return retimeResult;
+        }
+        const MediaFoundationSession mediaFoundation;
+        if (FAILED(mediaFoundation.Result())) {
+            retimeResult.nativeError = mediaFoundation.Result();
+            retimeResult.errorMessage = ErrorText(
+                L"启动 H.264 重定时 Media Foundation 失败",
+                mediaFoundation.Result());
+            return retimeResult;
+        }
+
+        SourceTrack video;
+        StepResult step = OpenCompressedTrack(
+            sourcePath,
+            kVideoStream,
+            MFMediaType_Video,
+            MFVideoFormat_H264,
+            &video);
+        if (!step.Succeeded()) {
+            retimeResult.outcome = step.outcome;
+            retimeResult.nativeError = step.nativeError;
+            retimeResult.errorMessage = std::move(step.errorMessage);
+            return retimeResult;
+        }
+        HRESULT nativeResult = SeekReader(video.reader.Get(), 0);
+        if (FAILED(nativeResult)) {
+            retimeResult.nativeError = nativeResult;
+            retimeResult.errorMessage = ErrorText(
+                L"定位 H.264 重定时起点失败",
+                nativeResult);
+            return retimeResult;
+        }
+
+        ComPtr<IMFAttributes> writerAttributes;
+        nativeResult = ::MFCreateAttributes(&writerAttributes, 4);
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writerAttributes->SetUINT32(
+                MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                TRUE);
+        }
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writerAttributes->SetUINT32(
+                MF_MPEG4SINK_SPSPPS_PASSTHROUGH,
+                TRUE);
+        }
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writerAttributes->SetUINT32(
+                MF_SINK_WRITER_DISABLE_THROTTLING,
+                TRUE);
+        }
+
+        DestinationCleanup destinationCleanup(destinationPath);
+        destinationCleanup.Activate();
+        ComPtr<IMFSinkWriter> writer;
+        DWORD outputStream = 0;
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = ::MFCreateSinkWriterFromURL(
+                destinationPath.c_str(),
+                nullptr,
+                writerAttributes.Get(),
+                &writer);
+        }
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writer->AddStream(
+                video.nativeType.Get(),
+                &outputStream);
+        }
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writer->SetInputMediaType(
+                outputStream,
+                video.nativeType.Get(),
+                nullptr);
+        }
+        if (SUCCEEDED(nativeResult)) {
+            nativeResult = writer->BeginWriting();
+        }
+        if (FAILED(nativeResult)) {
+            retimeResult.nativeError = nativeResult;
+            retimeResult.errorMessage = ErrorText(
+                L"启动 H.264 压缩域重定时失败",
+                nativeResult);
+            return retimeResult;
+        }
+
+        const auto scaleTicks = [&request](const LONGLONG value) noexcept {
+            if (value <= 0) {
+                return LONGLONG{0};
+            }
+            const long double scaled =
+                static_cast<long double>(value) * 10.0L /
+                static_cast<long double>(request.playbackSpeedTenths);
+            return static_cast<LONGLONG>(std::llround(std::min<long double>(
+                scaled,
+                static_cast<long double>(
+                    std::numeric_limits<LONGLONG>::max()))));
+        };
+
+        LONGLONG previousSourceTime = -1;
+        LONGLONG previousSourceEnd = -1;
+        LONGLONG previousOutputTime = -1;
+        LONGLONG previousOutputEnd = 0;
+        bool firstSample = true;
+        for (;;) {
+            if (stopToken.stop_requested()) {
+                retimeResult.outcome = AudioVideoMuxOutcome::Cancelled;
+                retimeResult.nativeError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                return retimeResult;
+            }
+
+            DWORD actualStream = 0;
+            DWORD flags = 0;
+            LONGLONG sampleTime = 0;
+            ComPtr<IMFSample> sample;
+            nativeResult = video.reader->ReadSample(
+                kVideoStream,
+                0,
+                &actualStream,
+                &flags,
+                &sampleTime,
+                &sample);
+            static_cast<void>(actualStream);
+            if (FAILED(nativeResult) ||
+                (flags & MF_SOURCE_READERF_ERROR) != 0) {
+                retimeResult.nativeError = FAILED(nativeResult)
+                    ? nativeResult
+                    : E_FAIL;
+                retimeResult.errorMessage = ErrorText(
+                    L"读取 H.264 重定时样本失败",
+                    retimeResult.nativeError);
+                return retimeResult;
+            }
+            if ((flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED |
+                          MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED)) != 0) {
+                retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+                retimeResult.nativeError = MF_E_INVALIDMEDIATYPE;
+                retimeResult.errorMessage = L"H.264 轨道在重定时期间改变了媒体类型。";
+                return retimeResult;
+            }
+            if ((flags & MF_SOURCE_READERF_STREAMTICK) != 0) {
+                retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+                retimeResult.nativeError = MF_E_INVALID_TIMESTAMP;
+                retimeResult.errorMessage = L"H.264 轨道包含无法压缩域重定时的 stream tick。";
+                return retimeResult;
+            }
+            if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) {
+                break;
+            }
+            if (sample == nullptr) {
+                continue;
+            }
+
+            LONGLONG sampleDuration = 0;
+            nativeResult = sample->GetSampleDuration(&sampleDuration);
+            if (FAILED(nativeResult) || sampleDuration <= 0) {
+                retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+                retimeResult.nativeError = MF_E_INVALID_TIMESTAMP;
+                retimeResult.errorMessage = L"H.264 压缩样本缺少有效时长。";
+                return retimeResult;
+            }
+            step = ValidateSampleTimeline(
+                sampleTime,
+                sampleDuration,
+                &previousSourceTime,
+                &previousSourceEnd,
+                L"H.264 ");
+            if (!step.Succeeded()) {
+                retimeResult.outcome = step.outcome;
+                retimeResult.nativeError = step.nativeError;
+                retimeResult.errorMessage = std::move(step.errorMessage);
+                return retimeResult;
+            }
+            if (firstSample &&
+                (sampleTime != 0 || !IsCleanPoint(sample.Get()))) {
+                retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+                retimeResult.nativeError = MF_E_INVALID_TIMESTAMP;
+                retimeResult.errorMessage = L"H.264 重定时源必须从时间零的 CleanPoint 开始。";
+                return retimeResult;
+            }
+            step = ValidateAndRemoveVideoDecodeTimestamp(
+                sample.Get(),
+                sampleTime);
+            if (!step.Succeeded()) {
+                retimeResult.outcome = step.outcome;
+                retimeResult.nativeError = step.nativeError;
+                retimeResult.errorMessage = std::move(step.errorMessage);
+                return retimeResult;
+            }
+
+            LONGLONG outputTime = scaleTicks(sampleTime);
+            LONGLONG outputEnd = scaleTicks(sampleTime + sampleDuration);
+            if (previousOutputTime >= 0) {
+                outputTime = std::max(outputTime, previousOutputEnd);
+            }
+            outputEnd = std::max(outputEnd, outputTime + 1);
+            const LONGLONG outputDuration = outputEnd - outputTime;
+            nativeResult = sample->SetSampleTime(outputTime);
+            if (SUCCEEDED(nativeResult)) {
+                nativeResult = sample->SetSampleDuration(outputDuration);
+            }
+            if (SUCCEEDED(nativeResult) && firstSample) {
+                nativeResult = sample->SetUINT32(
+                    MFSampleExtension_Discontinuity,
+                    TRUE);
+            }
+            if (SUCCEEDED(nativeResult)) {
+                nativeResult = writer->WriteSample(
+                    outputStream,
+                    sample.Get());
+            }
+            if (FAILED(nativeResult)) {
+                retimeResult.nativeError = nativeResult;
+                retimeResult.errorMessage = ErrorText(
+                    L"写入 H.264 重定时样本失败",
+                    nativeResult);
+                return retimeResult;
+            }
+            firstSample = false;
+            previousOutputTime = outputTime;
+            previousOutputEnd = outputEnd;
+            ++retimeResult.videoSamples;
+        }
+
+        if (retimeResult.videoSamples == 0 || firstSample) {
+            retimeResult.outcome = AudioVideoMuxOutcome::Unsupported;
+            retimeResult.nativeError = MF_E_END_OF_STREAM;
+            retimeResult.errorMessage = L"H.264 重定时源不包含视频样本。";
+            return retimeResult;
+        }
+        if (stopToken.stop_requested()) {
+            retimeResult.outcome = AudioVideoMuxOutcome::Cancelled;
+            retimeResult.nativeError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            return retimeResult;
+        }
+        nativeResult = writer->Finalize();
+        writer.Reset();
+        if (FAILED(nativeResult)) {
+            retimeResult.nativeError = nativeResult;
+            retimeResult.errorMessage = ErrorText(
+                L"完成 H.264 压缩域重定时失败",
+                nativeResult);
+            return retimeResult;
+        }
+
+        retimeResult.outcome = AudioVideoMuxOutcome::Succeeded;
+        retimeResult.nativeError = S_OK;
+        retimeResult.outputDuration = TicksToNanoseconds(previousOutputEnd);
+        retimeResult.errorMessage.clear();
+        destinationCleanup.Release();
+        return retimeResult;
+    } catch (const std::exception&) {
+        retimeResult.nativeError = E_UNEXPECTED;
+        retimeResult.errorMessage = L"H.264 重定时发生未预期的标准库异常。";
+        return retimeResult;
+    } catch (...) {
+        retimeResult.nativeError = E_UNEXPECTED;
+        retimeResult.errorMessage = L"H.264 重定时发生未预期异常。";
+        return retimeResult;
+    }
+}
 
 AudioVideoMuxResult AudioVideoMuxer::Mux(
     const AudioVideoMuxRequest& request,

@@ -23,7 +23,9 @@ constexpr COLORREF kTick = editor_theme::TimelineTick;
 constexpr COLORREF kDisabledFill = editor_theme::ControlDisabled;
 constexpr COLORREF kDisabledInk = editor_theme::TextDisabled;
 constexpr UINT_PTR kMotionTimerId = 0x5110;
+constexpr UINT_PTR kBoundaryFeedbackTimerId = 0x5111;
 constexpr UINT kMotionFrameMilliseconds = 16;
+constexpr UINT kBoundaryFeedbackMilliseconds = 120;
 constexpr auto kHoverEnterDuration = std::chrono::milliseconds(160);
 constexpr auto kHoverExitDuration = std::chrono::milliseconds(120);
 constexpr auto kPressEnterDuration = std::chrono::milliseconds(100);
@@ -146,6 +148,7 @@ void TrimTimeline::Destroy() noexcept {
         if (motionTimerArmed_) {
             ::KillTimer(window_, kMotionTimerId);
         }
+        ::KillTimer(window_, kBoundaryFeedbackTimerId);
         ::DestroyWindow(window_);
     }
     ReleaseBackBuffer();
@@ -154,6 +157,7 @@ void TrimTimeline::Destroy() noexcept {
     deferredNotification_.reset();
     notificationMessagePosted_ = false;
     motionTimerArmed_ = false;
+    feedbackPart_ = ActivePart::None;
     layoutCacheValid_ = false;
     ResetMotion();
 }
@@ -292,14 +296,20 @@ void TrimTimeline::SetRange(
     if (trimEnd_ <= trimStart_) {
         trimEnd_ = std::min(duration_, trimStart_ + std::chrono::milliseconds(1));
     }
-    playhead_ = std::clamp(playhead_, trimStart_, trimEnd_);
+    playhead_ = std::clamp(
+        playhead_,
+        std::chrono::milliseconds::zero(),
+        duration_);
     if (window_ != nullptr) {
         ::InvalidateRect(window_, nullptr, FALSE);
     }
 }
 
 void TrimTimeline::SetPlayhead(const std::chrono::milliseconds position) {
-    const auto clamped = std::clamp(position, trimStart_, trimEnd_);
+    const auto clamped = std::clamp(
+        position,
+        std::chrono::milliseconds::zero(),
+        duration_);
     if (clamped == playhead_) {
         return;
     }
@@ -307,6 +317,60 @@ void TrimTimeline::SetPlayhead(const std::chrono::milliseconds position) {
     if (window_ != nullptr) {
         ::InvalidateRect(window_, nullptr, FALSE);
     }
+}
+
+bool TrimTimeline::CommitTrimStart(const std::chrono::milliseconds position) {
+    const auto minimumSpan = std::min(duration_, std::chrono::milliseconds(100));
+    const auto candidate = std::clamp(
+        position,
+        std::chrono::milliseconds::zero(),
+        duration_);
+    if (candidate > trimEnd_ - minimumSpan) {
+        return false;
+    }
+    activePart_ = ActivePart::Start;
+    playhead_ = candidate;
+    if (candidate == trimStart_) {
+        ShowBoundaryFeedback(ActivePart::Start);
+        return false;
+    }
+    trimStart_ = candidate;
+    ShowBoundaryFeedback(ActivePart::Start);
+    if (window_ != nullptr) {
+        ::InvalidateRect(window_, nullptr, FALSE);
+    }
+    QueueNotification(
+        TimelineRangeChanged,
+        TimelineInteractionPhase::Committed,
+        playhead_);
+    return true;
+}
+
+bool TrimTimeline::CommitTrimEnd(const std::chrono::milliseconds position) {
+    const auto minimumSpan = std::min(duration_, std::chrono::milliseconds(100));
+    const auto candidate = std::clamp(
+        position,
+        std::chrono::milliseconds::zero(),
+        duration_);
+    if (candidate < trimStart_ + minimumSpan) {
+        return false;
+    }
+    activePart_ = ActivePart::End;
+    playhead_ = candidate;
+    if (candidate == trimEnd_) {
+        ShowBoundaryFeedback(ActivePart::End);
+        return false;
+    }
+    trimEnd_ = candidate;
+    ShowBoundaryFeedback(ActivePart::End);
+    if (window_ != nullptr) {
+        ::InvalidateRect(window_, nullptr, FALSE);
+    }
+    QueueNotification(
+        TimelineRangeChanged,
+        TimelineInteractionPhase::Committed,
+        playhead_);
+    return true;
 }
 
 void TrimTimeline::SetEnabled(const bool enabled) {
@@ -325,6 +389,10 @@ void TrimTimeline::SetEnabled(const bool enabled) {
         }
     }
     if (!enabled) {
+        if (window_ != nullptr) {
+            ::KillTimer(window_, kBoundaryFeedbackTimerId);
+        }
+        feedbackPart_ = ActivePart::None;
         ResetMotion();
         if (window_ != nullptr && motionTimerArmed_) {
             ::KillTimer(window_, kMotionTimerId);
@@ -448,6 +516,12 @@ LRESULT TrimTimeline::HandleMessage(
         if (!enabled_) {
             return 0;
         }
+        if (feedbackPart_ != ActivePart::None) {
+            ::KillTimer(window_, kBoundaryFeedbackTimerId);
+            feedbackPart_ = ActivePart::None;
+            startPressMotion_.JumpTo(0.0F);
+            endPressMotion_.JumpTo(0.0F);
+        }
         ::SetFocus(window_);
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ActivePart hit = HitTestPart(point);
@@ -562,6 +636,16 @@ LRESULT TrimTimeline::HandleMessage(
             }
             return 0;
         }
+        if (wParam == kBoundaryFeedbackTimerId) {
+            ::KillTimer(window_, kBoundaryFeedbackTimerId);
+            feedbackPart_ = ActivePart::None;
+            if (!dragging_) {
+                startPressMotion_.JumpTo(0.0F);
+                endPressMotion_.JumpTo(0.0F);
+                ::InvalidateRect(window_, nullptr, FALSE);
+            }
+            return 0;
+        }
         break;
     case WM_KEYDOWN: {
         if (!enabled_) {
@@ -627,12 +711,14 @@ LRESULT TrimTimeline::HandleMessage(
         if (motionTimerArmed_) {
             ::KillTimer(destroyedWindow, kMotionTimerId);
         }
+        ::KillTimer(destroyedWindow, kBoundaryFeedbackTimerId);
         ReleaseBackBuffer();
         ::SetWindowLongPtrW(destroyedWindow, GWLP_USERDATA, 0);
         trackingMouse_ = false;
         dragging_ = false;
         keyboardAdjusting_ = false;
         motionTimerArmed_ = false;
+        feedbackPart_ = ActivePart::None;
         layoutCacheValid_ = false;
         pendingNotification_.reset();
         deferredNotification_.reset();
@@ -997,7 +1083,10 @@ void TrimTimeline::UpdateFromPointer(const int x, const bool notify) {
 
     if (dragPart_ == ActivePart::Playhead) {
         boundarySnap_ = BoundarySnap::None;
-        playhead_ = std::clamp(value, trimStart_, trimEnd_);
+        playhead_ = std::clamp(
+            value,
+            std::chrono::milliseconds::zero(),
+            duration_);
         if (playhead_ == previousPlayhead) {
             return;
         }
@@ -1114,6 +1203,27 @@ void TrimTimeline::CommitKeyboardAdjustment() {
         TimelineRangeChanged,
         TimelineInteractionPhase::Committed,
         playhead_);
+}
+
+void TrimTimeline::ShowBoundaryFeedback(const ActivePart part) noexcept {
+    if (window_ == nullptr ||
+        (part != ActivePart::Start && part != ActivePart::End)) {
+        return;
+    }
+    ::KillTimer(window_, kBoundaryFeedbackTimerId);
+    feedbackPart_ = part;
+    startPressMotion_.JumpTo(part == ActivePart::Start ? 1.0F : 0.0F);
+    endPressMotion_.JumpTo(part == ActivePart::End ? 1.0F : 0.0F);
+    if (::SetTimer(
+            window_,
+            kBoundaryFeedbackTimerId,
+            kBoundaryFeedbackMilliseconds,
+            nullptr) == 0) {
+        feedbackPart_ = ActivePart::None;
+        startPressMotion_.JumpTo(0.0F);
+        endPressMotion_.JumpTo(0.0F);
+    }
+    ::InvalidateRect(window_, nullptr, FALSE);
 }
 
 int TrimTimeline::TimeToX(const std::chrono::milliseconds value) noexcept {

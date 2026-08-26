@@ -135,7 +135,12 @@ void DrawCircle(HDC device, POINT center, int radius, COLORREF color) {
     return RECT{corners[0].x, corners[0].y, corners[1].x, corners[1].y};
 }
 
-void DrawInstruction(HWND window, HDC device, const RECT& client, UINT dpi) {
+void DrawInstruction(
+    HWND window,
+    HDC device,
+    const RECT& client,
+    UINT dpi,
+    const SelectionUiState& state) {
     const HFONT titleFont = CreateUiFont(dpi, 14, FW_BOLD);
     const HFONT detailFont = CreateUiFont(dpi, 13, FW_NORMAL);
     if (titleFont == nullptr || detailFont == nullptr) {
@@ -148,14 +153,20 @@ void DrawInstruction(HWND window, HDC device, const RECT& client, UINT dpi) {
         return;
     }
 
-    constexpr wchar_t kTitle[] = L"拖动框选录制区域";
-    constexpr wchar_t kDetail[] = L"单击全屏   Esc 取消";
+    const wchar_t* title = state.adjusting
+        ? L"调整录制区域"
+        : L"拖动框选录制区域";
+    const wchar_t* detail = state.adjusting
+        ? (state.selectionValid
+              ? L"拖动边缘或区域   Enter 开始   Esc 取消"
+              : L"选区不能跨越显示器，请调整后再开始")
+        : L"单击全屏   Esc 取消";
     const HGDIOBJ oldFont = SelectObject(device, titleFont);
     SIZE titleSize{};
-    GetTextExtentPoint32W(device, kTitle, static_cast<int>(std::size(kTitle) - 1), &titleSize);
+    GetTextExtentPoint32W(device, title, static_cast<int>(wcslen(title)), &titleSize);
     SelectObject(device, detailFont);
     SIZE detailSize{};
-    GetTextExtentPoint32W(device, kDetail, static_cast<int>(std::size(kDetail) - 1), &detailSize);
+    GetTextExtentPoint32W(device, detail, static_cast<int>(wcslen(detail)), &detailSize);
 
     const int horizontalPadding = ScaleForDpi(14, dpi);
     const int dotDiameter = ScaleForDpi(8, dpi);
@@ -198,7 +209,7 @@ void DrawInstruction(HWND window, HDC device, const RECT& client, UINT dpi) {
         panel.bottom};
     DrawTextW(
         device,
-        kTitle,
+        title,
         -1,
         &titleBounds,
         DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
@@ -220,7 +231,7 @@ void DrawInstruction(HWND window, HDC device, const RECT& client, UINT dpi) {
         panel.bottom};
     DrawTextW(
         device,
-        kDetail,
+        detail,
         -1,
         &detailBounds,
         DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -230,7 +241,12 @@ void DrawInstruction(HWND window, HDC device, const RECT& client, UINT dpi) {
     DeleteObject(titleFont);
 }
 
-void DrawSizeBadge(HDC device, const RECT& selection, const RECT& client, UINT dpi) {
+void DrawSizeBadge(
+    HDC device,
+    const RECT& selection,
+    const RECT& client,
+    UINT dpi,
+    bool adjusting) {
     wchar_t dimensions[64]{};
     swprintf_s(
         dimensions,
@@ -251,18 +267,28 @@ void DrawSizeBadge(HDC device, const RECT& selection, const RECT& client, UINT d
     const int gap = ScaleForDpi(8, dpi);
     const int width = textSize.cx + horizontalPadding * 2;
     const int height = textSize.cy + verticalPadding * 2;
-    RECT badge{
-        selection.left,
-        selection.bottom + gap,
-        selection.left + width,
-        selection.bottom + gap + height};
-    if (badge.bottom > client.bottom - ScaleForDpi(8, dpi)) {
-        badge.bottom = selection.top - gap;
-        badge.top = badge.bottom - height;
-    }
-    if (badge.top < client.top + ScaleForDpi(8, dpi)) {
-        badge.top = selection.top + gap;
-        badge.bottom = badge.top + height;
+    RECT badge{};
+    if (adjusting && selection.right - selection.left >= width + gap * 2 &&
+        selection.bottom - selection.top >= height + gap * 2) {
+        badge = RECT{
+            selection.left + gap,
+            selection.top + gap,
+            selection.left + gap + width,
+            selection.top + gap + height};
+    } else {
+        badge = RECT{
+            selection.left,
+            selection.bottom + gap,
+            selection.left + width,
+            selection.bottom + gap + height};
+        if (badge.bottom > client.bottom - ScaleForDpi(8, dpi)) {
+            badge.bottom = selection.top - gap;
+            badge.top = badge.bottom - height;
+        }
+        if (badge.top < client.top + ScaleForDpi(8, dpi)) {
+            badge.top = selection.top + gap;
+            badge.bottom = badge.top + height;
+        }
     }
 
     badge.left = std::clamp(
@@ -288,7 +314,12 @@ void DrawSizeBadge(HDC device, const RECT& selection, const RECT& client, UINT d
     DeleteObject(font);
 }
 
-void DrawHandles(HDC device, const RECT& selection, const RECT& client, UINT dpi) {
+void DrawHandles(
+    HDC device,
+    const RECT& selection,
+    const RECT& client,
+    UINT dpi,
+    bool selectionValid) {
     const int radius = std::max(4, ScaleForDpi(5, dpi));
     const int innerRadius = std::max(2, radius - std::max(2, ScaleForDpi(2, dpi)));
     const LONG right = std::max(selection.left, selection.right - 1);
@@ -313,9 +344,109 @@ void DrawHandles(HDC device, const RECT& selection, const RECT& client, UINT dpi
             handle.y,
             client.top + radius,
             std::max<LONG>(client.top + radius, client.bottom - radius - 1));
-        DrawCircle(device, handle, radius, theme::Primary);
+        DrawCircle(device, handle, radius, selectionValid ? theme::Primary : theme::Danger);
         DrawCircle(device, handle, innerRadius, theme::Background);
     }
+}
+
+void DrawControlButton(
+    HDC device,
+    const RECT& bounds,
+    const wchar_t* label,
+    UINT dpi,
+    bool primary,
+    bool enabled,
+    bool hovered,
+    bool pressed) {
+    constexpr COLORREF kNeutral = RGB(48, 48, 46);
+    constexpr COLORREF kNeutralHover = RGB(58, 58, 55);
+    constexpr COLORREF kNeutralPressed = RGB(39, 39, 37);
+    constexpr COLORREF kDisabled = RGB(56, 56, 53);
+    constexpr COLORREF kDisabledText = RGB(139, 139, 134);
+
+    COLORREF fill = primary ? theme::Primary : kNeutral;
+    if (!enabled) {
+        fill = kDisabled;
+    } else if (pressed) {
+        fill = primary ? theme::PrimaryPressed : kNeutralPressed;
+    } else if (hovered) {
+        fill = primary ? theme::PrimaryHover : kNeutralHover;
+    }
+
+    ui::Canvas canvas(device);
+    if (canvas.Valid()) {
+        canvas.DrawRoundedRectangle(
+            bounds,
+            static_cast<float>(ScaleForDpi(theme::CornerSmall, dpi)),
+            fill,
+            primary || !enabled ? fill : theme::BorderStrong,
+            static_cast<float>(std::max(1, ScaleForDpi(1, dpi))));
+    } else {
+        FillRoundedRectangle(
+            device,
+            bounds,
+            ScaleForDpi(theme::CornerSmall, dpi),
+            fill);
+    }
+
+    const HFONT font = CreateUiFont(dpi, 13, FW_BOLD);
+    if (font == nullptr) {
+        return;
+    }
+    const HGDIOBJ oldFont = SelectObject(device, font);
+    SetBkMode(device, TRANSPARENT);
+    SetTextColor(device, enabled ? theme::Background : kDisabledText);
+    RECT textBounds = bounds;
+    DrawTextW(
+        device,
+        label,
+        -1,
+        &textBounds,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    SelectObject(device, oldFont);
+    DeleteObject(font);
+}
+
+void DrawControlBar(
+    HDC device,
+    const RECT& client,
+    const RECT& selection,
+    UINT dpi,
+    const SelectionUiState& state) {
+    if (!state.adjusting || IsEmpty(selection)) {
+        return;
+    }
+
+    const ControlLayout layout = CalculateControlLayout(
+        client,
+        selection,
+        state.activeMonitorBounds,
+        dpi);
+    FillRoundedRectangle(
+        device,
+        layout.panel,
+        ScaleForDpi(theme::CornerMedium, dpi),
+        theme::OverlayPanel);
+    DrawControlButton(
+        device,
+        layout.startButton,
+        L"开始录制",
+        dpi,
+        true,
+        state.selectionValid,
+        state.hoveredButton == ControlButton::Start,
+        state.pressedButton == ControlButton::Start &&
+            state.hoveredButton == ControlButton::Start);
+    DrawControlButton(
+        device,
+        layout.cancelButton,
+        L"取消",
+        dpi,
+        false,
+        true,
+        state.hoveredButton == ControlButton::Cancel,
+        state.pressedButton == ControlButton::Cancel &&
+            state.hoveredButton == ControlButton::Cancel);
 }
 
 void RenderFrame(
@@ -323,7 +454,8 @@ void RenderFrame(
     HDC device,
     const RECT& client,
     const RECT& selection,
-    UINT dpi) {
+    UINT dpi,
+    const SelectionUiState& state) {
     FillSolidRectangle(device, client, theme::OverlayMask);
 
     if (!IsEmpty(selection)) {
@@ -332,12 +464,13 @@ void RenderFrame(
             device,
             selection,
             std::max(2, ScaleForDpi(2, dpi)),
-            theme::Primary);
-        DrawHandles(device, selection, client, dpi);
-        DrawSizeBadge(device, selection, client, dpi);
+            state.selectionValid ? theme::Primary : theme::Danger);
+        DrawHandles(device, selection, client, dpi, state.selectionValid);
+        DrawSizeBadge(device, selection, client, dpi, state.adjusting);
     }
 
-    DrawInstruction(window, device, client, dpi);
+    DrawInstruction(window, device, client, dpi, state);
+    DrawControlBar(device, client, selection, dpi, state);
 }
 
 }  // namespace
@@ -393,7 +526,87 @@ bool IsEmpty(const RECT& rectangle) noexcept {
     return rectangle.right <= rectangle.left || rectangle.bottom <= rectangle.top;
 }
 
-void Paint(HWND window, const RECT& selection, UINT dpi, FrameBuffer& frameBuffer) {
+ControlLayout CalculateControlLayout(
+    const RECT& client,
+    const RECT& selection,
+    const RECT& activeMonitorBounds,
+    const UINT dpi) noexcept {
+    const int outerPadding = ScaleForDpi(6, dpi);
+    const int buttonGap = ScaleForDpi(6, dpi);
+    const int buttonHeight = ScaleForDpi(36, dpi);
+    const int preferredStartWidth = ScaleForDpi(92, dpi);
+    const int preferredCancelWidth = ScaleForDpi(64, dpi);
+    const int preferredPanelWidth =
+        outerPadding * 2 + preferredStartWidth + buttonGap + preferredCancelWidth;
+    const int panelHeight = outerPadding * 2 + buttonHeight;
+    const int selectionGap = ScaleForDpi(9, dpi);
+    const int monitorMargin = ScaleForDpi(8, dpi);
+
+    RECT monitor = activeMonitorBounds;
+    monitor.left = std::clamp(monitor.left, client.left, client.right);
+    monitor.top = std::clamp(monitor.top, client.top, client.bottom);
+    monitor.right = std::clamp(monitor.right, client.left, client.right);
+    monitor.bottom = std::clamp(monitor.bottom, client.top, client.bottom);
+    if (monitor.right <= monitor.left || monitor.bottom <= monitor.top) {
+        monitor = client;
+    }
+
+    const int availablePanelWidth = static_cast<int>(std::max<LONG>(
+        1L,
+        monitor.right - monitor.left - monitorMargin * 2));
+    const int panelWidth = std::min(preferredPanelWidth, availablePanelWidth);
+    const int availableButtonWidth = std::max(
+        2,
+        panelWidth - outerPadding * 2 - buttonGap);
+    const int cancelWidth = std::min(
+        preferredCancelWidth,
+        std::max(1, availableButtonWidth * 2 / 5));
+    const int startWidth = std::max(1, availableButtonWidth - cancelWidth);
+
+    LONG left = selection.right - panelWidth;
+    LONG top = selection.bottom + selectionGap;
+    if (top + panelHeight > monitor.bottom - monitorMargin) {
+        top = selection.top - selectionGap - panelHeight;
+    }
+    if (top < monitor.top + monitorMargin) {
+        // Extremely short selections and small rotated displays use an
+        // in-frame placement rather than allowing the confirmation controls
+        // to leave the active monitor.
+        top = selection.bottom - panelHeight - selectionGap;
+    }
+
+    const LONG minimumLeft = monitor.left + monitorMargin;
+    const LONG maximumLeft = std::max<LONG>(
+        minimumLeft,
+        monitor.right - panelWidth - monitorMargin);
+    left = std::clamp(left, minimumLeft, maximumLeft);
+    const LONG minimumTop = monitor.top + monitorMargin;
+    const LONG maximumTop = std::max<LONG>(
+        minimumTop,
+        monitor.bottom - panelHeight - monitorMargin);
+    top = std::clamp(top, minimumTop, maximumTop);
+
+    ControlLayout layout;
+    layout.panel = RECT{left, top, left + panelWidth, top + panelHeight};
+    layout.startButton = RECT{
+        layout.panel.left + outerPadding,
+        layout.panel.top + outerPadding,
+        layout.panel.left + outerPadding + startWidth,
+        layout.panel.bottom - outerPadding};
+    layout.cancelButton = RECT{
+        layout.startButton.right + buttonGap,
+        layout.startButton.top,
+        layout.startButton.right + buttonGap + cancelWidth,
+        layout.startButton.bottom};
+    return layout;
+}
+
+void Paint(
+    HWND window,
+    const RECT& selection,
+    const UINT dpi,
+    const SelectionUiState& state,
+    FrameBuffer& frameBuffer) {
     PAINTSTRUCT paint{};
     const HDC device = BeginPaint(window, &paint);
     if (device == nullptr) {
@@ -406,12 +619,12 @@ void Paint(HWND window, const RECT& selection, UINT dpi, FrameBuffer& frameBuffe
         std::max<LONG>(1, client.right - client.left),
         std::max<LONG>(1, client.bottom - client.top)};
     if (frameBuffer.Ensure(device, size)) {
-        RenderFrame(window, frameBuffer.Device(), client, selection, dpi);
+        RenderFrame(window, frameBuffer.Device(), client, selection, dpi, state);
         BitBlt(device, 0, 0, size.cx, size.cy, frameBuffer.Device(), 0, 0, SRCCOPY);
     } else {
         // Preserve usability even if a very large virtual desktop cannot
         // allocate its backing bitmap. This fallback is intentionally rare.
-        RenderFrame(window, device, client, selection, dpi);
+        RenderFrame(window, device, client, selection, dpi, state);
     }
     EndPaint(window, &paint);
 }

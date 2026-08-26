@@ -73,6 +73,18 @@ AppSettings ConfigStore::Load() const {
     // truncated, or manually corrupted values keep the editor open.
     settings.keepEditorOpenAfterExport =
         std::wstring_view(keepEditorOpenBuffer.data()) != L"0";
+    std::array<wchar_t, 8> adjustSelectionBuffer{};
+    ::GetPrivateProfileStringW(
+        kSection,
+        L"AdjustSelectionBeforeRecording",
+        L"0",
+        adjustSelectionBuffer.data(),
+        static_cast<DWORD>(adjustSelectionBuffer.size()),
+        filePath_.c_str());
+    // The opt-in workflow must never become active because of a missing or
+    // malformed setting. Only an explicitly persisted "1" enables it.
+    settings.adjustSelectionBeforeRecording =
+        std::wstring_view(adjustSelectionBuffer.data()) == L"1";
 
     std::wstring ignoredError;
     static_cast<void>(win32::EnsureDirectory(settings.saveDirectory, &ignoredError));
@@ -100,8 +112,12 @@ bool ConfigStore::Save(const AppSettings& settings) const {
         filePath_,
         L"KeepEditorOpenAfterExport",
         settings.keepEditorOpenAfterExport ? L"1" : L"0");
+    const bool adjustSelectionWritten = WriteValue(
+        filePath_,
+        L"AdjustSelectionBeforeRecording",
+        settings.adjustSelectionBeforeRecording ? L"1" : L"0");
     return fpsWritten && directoryWritten && formatWritten && cursorWritten &&
-        keepEditorOpenWritten;
+        keepEditorOpenWritten && adjustSelectionWritten;
 }
 
 bool ConfigStore::LoadStartupEnabled() const {
@@ -175,6 +191,30 @@ bool ConfigStore::SaveKeepEditorOpenAfterExport(const bool enabled) const {
     ::GetPrivateProfileStringW(
         kSection,
         L"KeepEditorOpenAfterExport",
+        L"",
+        valueBuffer.data(),
+        static_cast<DWORD>(valueBuffer.size()),
+        filePath_.c_str());
+    return std::wstring_view(valueBuffer.data()) == (enabled ? L"1" : L"0");
+}
+
+bool ConfigStore::SaveAdjustSelectionBeforeRecording(const bool enabled) const {
+    std::wstring ignoredError;
+    if (!win32::EnsureDirectory(filePath_.parent_path(), &ignoredError) ||
+        !WriteValue(
+            filePath_,
+            L"AdjustSelectionBeforeRecording",
+            enabled ? L"1" : L"0")) {
+        return false;
+    }
+
+    static_cast<void>(
+        ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, filePath_.c_str()));
+
+    std::array<wchar_t, 8> valueBuffer{};
+    ::GetPrivateProfileStringW(
+        kSection,
+        L"AdjustSelectionBeforeRecording",
         L"",
         valueBuffer.data(),
         static_cast<DWORD>(valueBuffer.size()),

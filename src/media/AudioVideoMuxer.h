@@ -62,6 +62,22 @@ struct AudioVideoMuxResult final {
     bool droppedTrailingBoundaryAccessUnit{};
 };
 
+struct CompressedVideoRetimeRequest final {
+    // Source must begin with a time-zero H.264 CleanPoint and must not contain
+    // B-frame reordering. The compressed H.264 payload is copied byte-for-byte.
+    std::filesystem::path sourcePath;
+    std::filesystem::path destinationPath;
+    int playbackSpeedTenths{10};
+};
+
+struct CompressedVideoRetimeResult final {
+    AudioVideoMuxOutcome outcome{AudioVideoMuxOutcome::Failed};
+    HRESULT nativeError{E_FAIL};
+    std::wstring errorMessage;
+    std::uint64_t videoSamples{};
+    std::chrono::nanoseconds outputDuration{};
+};
+
 // Repackages an already-trimmed H.264 MP4 and a full-recording AAC sidecar
 // into one MP4. Neither track is decoded or encoded. H.264 samples are copied
 // byte-for-byte through the Media Foundation MPEG-4 sink; AAC samples are
@@ -71,6 +87,12 @@ class AudioVideoMuxer final {
 public:
     [[nodiscard]] static AudioVideoMuxResult Mux(
         const AudioVideoMuxRequest& request,
+        std::stop_token stopToken = {}) noexcept;
+
+    // Re-times an H.264-only MP4 without decoding or re-encoding its picture.
+    // Only sample timestamps/durations and container timing are regenerated.
+    [[nodiscard]] static CompressedVideoRetimeResult RetimeCompressedVideo(
+        const CompressedVideoRetimeRequest& request,
         std::stop_token stopToken = {}) noexcept;
 };
 

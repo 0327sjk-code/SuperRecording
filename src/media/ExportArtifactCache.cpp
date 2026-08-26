@@ -25,7 +25,7 @@ using namespace std::chrono_literals;
 
 constexpr std::wstring_view kArtifactPrefix = L"qrec-artifact-";
 constexpr std::wstring_view kStagingPrefix = L"qrec-cache-staging-";
-constexpr std::wstring_view kCacheVersion = L"qrec-export-cache-v8-system-audio";
+constexpr std::wstring_view kCacheVersion = L"qrec-export-cache-v9-playback-speed";
 constexpr auto kArtifactRetention = std::chrono::hours(24 * 7);
 constexpr auto kStagingRetention = std::chrono::hours(24);
 
@@ -220,7 +220,7 @@ private:
 
 [[nodiscard]] std::wstring SerializeKey(const ExportArtifactCacheKey& key) {
     return std::format(
-        L"{}|{}:{}|{}|{}|{}|{}|{}|{}|{}:{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        L"{}|{}:{}|{}|{}|{}|{}|{}|{}|{}:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         kCacheVersion,
         key.normalizedSourcePath.size(),
         key.normalizedSourcePath,
@@ -239,7 +239,8 @@ private:
         key.audioChangeTime,
         key.trimStartMilliseconds,
         key.trimEndMilliseconds,
-        static_cast<unsigned int>(key.format));
+        static_cast<unsigned int>(key.format),
+        key.playbackSpeedTenths);
 }
 
 [[nodiscard]] std::wstring SerializeManifest(
@@ -305,7 +306,10 @@ private:
     hash = HashUnsignedValue(
         hash,
         static_cast<std::uint64_t>(key.trimEndMilliseconds));
-    return HashUnsignedValue(hash, static_cast<std::uint64_t>(key.format));
+    hash = HashUnsignedValue(hash, static_cast<std::uint64_t>(key.format));
+    return HashUnsignedValue(
+        hash,
+        static_cast<std::uint64_t>(key.playbackSpeedTenths));
 }
 
 [[nodiscard]] std::wstring NormalizeExtension(const std::wstring_view extension) {
@@ -759,12 +763,22 @@ std::optional<ExportArtifactCacheKey> ExportArtifactCache::BuildKey(
 std::optional<ExportArtifactCacheKey> ExportArtifactCache::BuildKey(
     const ExportRequest& request,
     std::wstring* errorMessage) noexcept {
+    if (request.playbackSpeedTenths < 1 ||
+        request.playbackSpeedTenths > 30) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"导出倍速必须在 0.1× 到 3.0× 之间。";
+        }
+        return std::nullopt;
+    }
     std::optional<ExportArtifactCacheKey> key = BuildKey(
         request.recording.sourcePath,
         request.trimStart,
         request.trimEnd,
         request.format,
         errorMessage);
+    if (key.has_value()) {
+        key->playbackSpeedTenths = request.playbackSpeedTenths;
+    }
     if (!key.has_value() || !request.includeSystemAudio) {
         return key;
     }
