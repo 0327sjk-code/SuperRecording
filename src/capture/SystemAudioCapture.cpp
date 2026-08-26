@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -58,6 +59,11 @@ inline constexpr std::uint32_t kMinimumAacSeedMilliseconds = 100;
 inline constexpr auto kCaptureWaitTimeout = 250ms;
 inline constexpr auto kStatsCallbackInterval = 250ms;
 inline constexpr auto kSilenceCatchUpHoldback = kCaptureWaitTimeout;
+inline constexpr auto kPendingPacketBudget =
+    kSilenceCatchUpHoldback +
+    2 * std::chrono::milliseconds(kRequestedBufferMilliseconds);
+inline constexpr auto kMaximumPacketFutureSkew =
+    2 * std::chrono::milliseconds(kRequestedBufferMilliseconds);
 
 void ClearError(SystemAudioCaptureError* error) {
     if (error != nullptr) {
@@ -184,6 +190,32 @@ void AssignError(
         return std::numeric_limits<std::uint64_t>::max();
     }
     return wholeFrames + partialFrames;
+}
+
+[[nodiscard]] std::uint64_t HundredNanosecondsForFramesCeiling(
+    const std::uint64_t frameCount,
+    const std::uint32_t sampleRate) noexcept {
+    constexpr std::uint64_t kTicksPerSecond =
+        static_cast<std::uint64_t>(kMediaFoundationTicksPerSecond);
+    if (frameCount == 0 || sampleRate == 0) {
+        return 0;
+    }
+
+    const std::uint64_t wholeSeconds = frameCount / sampleRate;
+    const std::uint64_t remainingFrames = frameCount % sampleRate;
+    if (wholeSeconds >
+        std::numeric_limits<std::uint64_t>::max() / kTicksPerSecond) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const std::uint64_t wholeTicks = wholeSeconds * kTicksPerSecond;
+    const std::uint64_t partialTicks =
+        (remainingFrames * kTicksPerSecond + sampleRate - 1ULL) /
+        sampleRate;
+    if (partialTicks >
+        std::numeric_limits<std::uint64_t>::max() - wholeTicks) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return wholeTicks + partialTicks;
 }
 
 [[nodiscard]] std::optional<std::uint64_t>
@@ -581,7 +613,10 @@ public:
     [[nodiscard]] bool ProcessPacket(
         const WasapiPacket& packet,
         const bool discard,
-        SystemAudioCaptureError& error) noexcept {
+        const std::optional<SystemAudioQpcPosition> endBoundaryQpc,
+        SystemAudioCaptureError& error,
+        const std::optional<std::uint64_t> maximumEncodedFrames =
+            std::nullopt) noexcept {
         const bool timestampReliable =
             (packet.flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0;
         const bool discontinuity =
@@ -597,6 +632,36 @@ public:
             stats_.discardedFramesDuringPause += packet.frameCount;
             UpdateDevicePosition(packet, timestampReliable);
             return true;
+        }
+
+        if (maximumEncodedFrames.has_value() &&
+            stats_.encodedFrames >= *maximumEncodedFrames) {
+            UpdateDevicePosition(packet, timestampReliable);
+            return true;
+        }
+
+        std::uint32_t availableFrameCount = packet.frameCount;
+        if (endBoundaryQpc.has_value()) {
+            if (!timestampReliable ||
+                packet.qpcPosition100Nanoseconds == 0 ||
+                packet.qpcPosition100Nanoseconds >= *endBoundaryQpc) {
+                UpdateDevicePosition(packet, timestampReliable);
+                return true;
+            }
+
+            const std::uint64_t boundaryFrames =
+                FramesForHundredNanoseconds(
+                    *endBoundaryQpc - packet.qpcPosition100Nanoseconds,
+                    sampleRate_,
+                    false);
+            availableFrameCount = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                    boundaryFrames,
+                    packet.frameCount));
+            if (availableFrameCount == 0) {
+                UpdateDevicePosition(packet, timestampReliable);
+                return true;
+            }
         }
 
         std::uint64_t desiredStartFrame = stats_.encodedFrames;
@@ -618,7 +683,7 @@ public:
                             packet.qpcPosition100Nanoseconds,
                         sampleRate_,
                         true),
-                    packet.frameCount);
+                    availableFrameCount);
                 desiredStartFrame = segmentTimelineStartFrame_;
             } else {
                 const std::uint64_t segmentOffset =
@@ -641,42 +706,88 @@ public:
             }
 
             if (desiredStartFrame > stats_.encodedFrames) {
+                if (maximumEncodedFrames.has_value()) {
+                    desiredStartFrame = std::min(
+                        desiredStartFrame,
+                        *maximumEncodedFrames);
+                }
                 if (!WriteSilence(
                         desiredStartFrame - stats_.encodedFrames,
                         error)) {
                     return false;
                 }
+                if (maximumEncodedFrames.has_value() &&
+                    stats_.encodedFrames >= *maximumEncodedFrames) {
+                    UpdateDevicePosition(packet, timestampReliable);
+                    return true;
+                }
             } else if (desiredStartFrame < stats_.encodedFrames &&
-                       framesToSkip < packet.frameCount) {
+                       framesToSkip < availableFrameCount) {
                 const std::uint64_t remainingFrames =
-                    packet.frameCount - framesToSkip;
+                    availableFrameCount - framesToSkip;
                 framesToSkip += std::min<std::uint64_t>(
                     stats_.encodedFrames - desiredStartFrame,
                     remainingFrames);
             }
         } else if (timestampReliable && hasDevicePosition_) {
             if (packet.devicePosition > devicePositionEnd_) {
-                const std::uint64_t gapFrames =
+                std::uint64_t gapFrames =
                     packet.devicePosition - devicePositionEnd_;
-                if (!WriteSilence(gapFrames, error)) {
+                const std::uint64_t maximumRecoverableGapFrames =
+                    FramesForDurationCeiling(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            kPendingPacketBudget),
+                        sampleRate_);
+                if (gapFrames > maximumRecoverableGapFrames) {
+                    // 未带 discontinuity 标记的异常设备位置不能触发无界
+                    // 静音写入；下一包重新建立设备基线。
+                    ResetDeviceBaseline();
+                    ++stats_.discontinuityCount;
+                    gapFrames = 0;
+                }
+                if (maximumEncodedFrames.has_value()) {
+                    gapFrames = std::min(
+                        gapFrames,
+                        *maximumEncodedFrames - stats_.encodedFrames);
+                }
+                if (gapFrames != 0 && !WriteSilence(gapFrames, error)) {
                     return false;
+                }
+                if (maximumEncodedFrames.has_value() &&
+                    stats_.encodedFrames >= *maximumEncodedFrames) {
+                    UpdateDevicePosition(packet, timestampReliable);
+                    return true;
                 }
             } else if (packet.devicePosition < devicePositionEnd_) {
                 framesToSkip = std::min<std::uint64_t>(
                     devicePositionEnd_ - packet.devicePosition,
-                    packet.frameCount);
+                    availableFrameCount);
             }
         }
 
-        if (framesToSkip >= packet.frameCount) {
+        if (framesToSkip >= availableFrameCount) {
             UpdateDevicePosition(packet, timestampReliable);
             return true;
         }
 
         const std::uint32_t skippedFrames =
             static_cast<std::uint32_t>(framesToSkip);
-        const std::uint32_t outputFrames =
-            packet.frameCount - skippedFrames;
+        std::uint32_t outputFrames =
+            availableFrameCount - skippedFrames;
+        if (maximumEncodedFrames.has_value()) {
+            if (stats_.encodedFrames >= *maximumEncodedFrames) {
+                UpdateDevicePosition(packet, timestampReliable);
+                return true;
+            }
+            const std::uint64_t remainingFrames =
+                *maximumEncodedFrames - stats_.encodedFrames;
+            outputFrames = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(outputFrames, remainingFrames));
+            if (outputFrames == 0) {
+                UpdateDevicePosition(packet, timestampReliable);
+                return true;
+            }
+        }
         const bool silent =
             (packet.flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
         std::span<const std::byte> outputSamples = packet.samples;
@@ -717,6 +828,34 @@ public:
         alignmentRequired_ = qpcPosition100Nanoseconds.has_value();
     }
 
+    [[nodiscard]] bool EndActiveSegment(
+        const std::optional<SystemAudioQpcPosition> boundaryQpc,
+        SystemAudioCaptureError& error) noexcept {
+        if (!boundaryQpc.has_value() ||
+            !segmentQpcStart100Nanoseconds_.has_value()) {
+            return true;
+        }
+
+        std::uint64_t targetFrame = segmentTimelineStartFrame_;
+        if (*boundaryQpc > *segmentQpcStart100Nanoseconds_) {
+            const std::uint64_t segmentFrames =
+                FramesForHundredNanoseconds(
+                    *boundaryQpc - *segmentQpcStart100Nanoseconds_,
+                    sampleRate_,
+                    false);
+            if (segmentFrames >
+                std::numeric_limits<std::uint64_t>::max() - targetFrame) {
+                error = MakeError(
+                    SystemAudioCaptureErrorCode::EncodeFailed,
+                    L"系统音频活动片段边界超出支持范围。",
+                    static_cast<long>(E_INVALIDARG));
+                return false;
+            }
+            targetFrame += segmentFrames;
+        }
+        return EnsureExactFrameCount(targetFrame, error);
+    }
+
     void ResetDeviceBaseline() noexcept {
         hasDevicePosition_ = false;
         devicePositionEnd_ = 0;
@@ -751,6 +890,32 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool EnsureExactDuration(
+        const std::chrono::nanoseconds exactDuration,
+        SystemAudioCaptureError& error) noexcept {
+        const std::uint64_t targetFrames = FramesForDurationCeiling(
+            exactDuration,
+            sampleRate_);
+        if (targetFrames == 0 && stats_.encodedFrames == 0) {
+            // Sink Writer 不能封口一个从未接收样本的 M4A。写入仅用于让
+            // Finalize 安全完成；零时长调用不能返回一条伪装成 exact 的音轨。
+            if (!WriteSilence(
+                    std::max<std::uint64_t>(
+                        1,
+                        static_cast<std::uint64_t>(sampleRate_) *
+                            kMinimumAacSeedMilliseconds / 1'000U),
+                    error)) {
+                return false;
+            }
+            error = MakeError(
+                SystemAudioCaptureErrorCode::EncodeFailed,
+                L"系统音频的目标时长为零，未生成可用音轨。",
+                static_cast<long>(E_INVALIDARG));
+            return false;
+        }
+        return EnsureExactFrameCount(targetFrames, error);
+    }
+
     [[nodiscard]] bool CatchUpSilence(
         const std::chrono::nanoseconds activeDuration,
         SystemAudioCaptureError& error) noexcept {
@@ -778,6 +943,26 @@ public:
     }
 
 private:
+    [[nodiscard]] bool EnsureExactFrameCount(
+        const std::uint64_t targetFrames,
+        SystemAudioCaptureError& error) noexcept {
+        if (stats_.encodedFrames > targetFrames) {
+            error = MakeError(
+                SystemAudioCaptureErrorCode::EncodeFailed,
+                L"系统音频已越过共享时间线边界，已停用本次音轨以避免音画错位。",
+                static_cast<long>(E_UNEXPECTED));
+            return false;
+        }
+        if (stats_.encodedFrames < targetFrames &&
+            !WriteSilence(targetFrames - stats_.encodedFrames, error)) {
+            return false;
+        }
+        ResetDeviceBaseline();
+        alignmentRequired_ =
+            segmentQpcStart100Nanoseconds_.has_value();
+        return true;
+    }
+
     void UpdateDevicePosition(
         const WasapiPacket& packet,
         const bool timestampReliable) noexcept {
@@ -886,6 +1071,118 @@ private:
     WasapiLoopbackSession& session,
     AudioTimelineWriter& timeline,
     const bool discard,
+    SystemAudioCaptureError& error,
+    const std::optional<SystemAudioQpcPosition> endBoundaryQpc =
+        std::nullopt) noexcept {
+    WasapiPacket packet;
+    for (;;) {
+        bool hasPacket = false;
+        const HRESULT result = session.ReadNextPacket(packet, hasPacket);
+        if (FAILED(result)) {
+            error = MakeWasapiError(
+                SystemAudioCaptureErrorCode::CaptureFailed,
+                L"读取系统回环音频包失败。",
+                result);
+            return false;
+        }
+        if (!hasPacket) {
+            return true;
+        }
+        if (!timeline.ProcessPacket(
+                packet,
+                discard,
+                endBoundaryQpc,
+                error)) {
+            return false;
+        }
+    }
+}
+
+class PendingPacketQueue final {
+public:
+    [[nodiscard]] bool Push(
+        WasapiPacket packet,
+        SystemAudioCaptureError& error) noexcept {
+        const std::uint64_t packetBytes = packet.samples.size();
+        if (packet.frameCount >
+                std::numeric_limits<std::uint64_t>::max() - queuedFrames_ ||
+            packetBytes >
+                std::numeric_limits<std::uint64_t>::max() - queuedBytes_) {
+            error = MakeError(
+                SystemAudioCaptureErrorCode::CaptureFailed,
+                L"系统音频预卷队列计数超出支持范围。",
+                static_cast<long>(E_INVALIDARG));
+            return false;
+        }
+
+        try {
+            packets_.push_back(std::move(packet));
+        } catch (const std::bad_alloc&) {
+            error = MakeError(
+                SystemAudioCaptureErrorCode::CaptureFailed,
+                L"系统音频预卷队列内存不足。",
+                static_cast<long>(E_OUTOFMEMORY));
+            return false;
+        } catch (...) {
+            error = MakeError(
+                SystemAudioCaptureErrorCode::CaptureFailed,
+                L"系统音频预卷队列写入失败。",
+                static_cast<long>(E_FAIL));
+            return false;
+        }
+
+        queuedFrames_ += packet.frameCount;
+        queuedBytes_ += packetBytes;
+        return true;
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return packets_.empty();
+    }
+
+    [[nodiscard]] WasapiPacket& Front() noexcept {
+        return packets_.front();
+    }
+
+    void PopFront() noexcept {
+        const WasapiPacket& packet = packets_.front();
+        queuedFrames_ -= packet.frameCount;
+        queuedBytes_ -= packet.samples.size();
+        packets_.pop_front();
+    }
+
+    void Clear() noexcept {
+        packets_.clear();
+        queuedFrames_ = 0;
+        queuedBytes_ = 0;
+    }
+
+    [[nodiscard]] bool ExceedsBudget(
+        const std::uint32_t sampleRate,
+        const std::uint32_t bytesPerFrame) const noexcept {
+        const std::uint64_t maximumFrames = FramesForDurationCeiling(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                kPendingPacketBudget),
+            sampleRate);
+        const std::uint64_t maximumBytes =
+            maximumFrames >
+                    std::numeric_limits<std::uint64_t>::max() / bytesPerFrame
+                ? std::numeric_limits<std::uint64_t>::max()
+                : maximumFrames * bytesPerFrame;
+        return queuedFrames_ > maximumFrames ||
+            queuedBytes_ > maximumBytes ||
+            packets_.size() > maximumFrames;
+    }
+
+private:
+    std::deque<WasapiPacket> packets_;
+    std::uint64_t queuedFrames_{};
+    std::uint64_t queuedBytes_{};
+};
+
+[[nodiscard]] bool CollectAvailablePackets(
+    WasapiLoopbackSession& session,
+    PendingPacketQueue& pendingPackets,
     SystemAudioCaptureError& error) noexcept {
     WasapiPacket packet;
     for (;;) {
@@ -901,13 +1198,149 @@ private:
         if (!hasPacket) {
             return true;
         }
-        if (!timeline.ProcessPacket(packet, discard, error)) {
+        if (!pendingPackets.Push(std::move(packet), error)) {
             return false;
         }
+        packet = {};
     }
 }
 
+[[nodiscard]] std::optional<SystemAudioQpcPosition> PacketEndQpc(
+    const WasapiPacket& packet,
+    const std::uint32_t sampleRate) noexcept {
+    if ((packet.flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0 ||
+        packet.qpcPosition100Nanoseconds == 0) {
+        return std::nullopt;
+    }
+    const std::uint64_t duration = HundredNanosecondsForFramesCeiling(
+        packet.frameCount,
+        sampleRate);
+    if (duration >
+        std::numeric_limits<std::uint64_t>::max() -
+            packet.qpcPosition100Nanoseconds) {
+        return std::nullopt;
+    }
+    return packet.qpcPosition100Nanoseconds + duration;
+}
+
+[[nodiscard]] std::optional<SystemAudioQpcPosition>
+MaturePacketBoundaryQpc() noexcept {
+    const std::optional<SystemAudioQpcPosition> now =
+        QueryPerformanceCounter100Nanoseconds();
+    if (!now.has_value()) {
+        return std::nullopt;
+    }
+    using HundredNanoseconds =
+        std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
+    const std::int64_t holdback =
+        std::chrono::duration_cast<HundredNanoseconds>(
+            kSilenceCatchUpHoldback).count();
+    if (holdback <= 0 ||
+        *now <= static_cast<std::uint64_t>(holdback)) {
+        return 0;
+    }
+    return *now - static_cast<std::uint64_t>(holdback);
+}
+
+[[nodiscard]] bool FlushPendingPackets(
+    PendingPacketQueue& pendingPackets,
+    AudioTimelineWriter& timeline,
+    const std::uint32_t sampleRate,
+    const std::uint32_t bytesPerFrame,
+    const bool flushAll,
+    const std::optional<SystemAudioQpcPosition> commitBoundaryQpc,
+    const std::optional<SystemAudioQpcPosition> endBoundaryQpc,
+    SystemAudioCaptureError& error,
+    const std::optional<std::uint64_t> maximumEncodedFrames =
+        std::nullopt) noexcept {
+    const std::optional<SystemAudioQpcPosition> localNow =
+        QueryPerformanceCounter100Nanoseconds();
+    using HundredNanoseconds =
+        std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
+    const std::int64_t futureSkewCount =
+        std::chrono::duration_cast<HundredNanoseconds>(
+            kMaximumPacketFutureSkew).count();
+    const std::uint64_t maximumPlausibleQpc =
+        localNow.has_value() && futureSkewCount > 0 &&
+                static_cast<std::uint64_t>(futureSkewCount) <=
+                    std::numeric_limits<std::uint64_t>::max() - *localNow
+            ? *localNow + static_cast<std::uint64_t>(futureSkewCount)
+            : std::numeric_limits<std::uint64_t>::max();
+
+    while (!pendingPackets.Empty()) {
+        WasapiPacket& packet = pendingPackets.Front();
+        bool forceSequential = pendingPackets.ExceedsBudget(
+            sampleRate,
+            bytesPerFrame);
+        std::optional<SystemAudioQpcPosition> packetEnd =
+            PacketEndQpc(packet, sampleRate);
+        if (localNow.has_value() &&
+            (packet.qpcPosition100Nanoseconds > maximumPlausibleQpc ||
+             (packetEnd.has_value() &&
+              *packetEnd > maximumPlausibleQpc))) {
+            forceSequential = true;
+        }
+
+        if (forceSequential) {
+            // 设备驱动的未来/跳变 QPC 不能阻塞队首。保留样本顺序，放弃
+            // 该包的时间戳并让下一可靠包重新锚定。
+            packet.flags |= AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR |
+                AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+            packet.qpcPosition100Nanoseconds = 0;
+            packetEnd.reset();
+        }
+
+        if (!flushAll && commitBoundaryQpc.has_value()) {
+            if (packetEnd.has_value() &&
+                *packetEnd > *commitBoundaryQpc) {
+                break;
+            }
+        }
+
+        const bool timestampUnavailable = !packetEnd.has_value();
+        const std::optional<SystemAudioQpcPosition> packetBoundary =
+            timestampUnavailable
+                ? std::nullopt
+                : flushAll ? endBoundaryQpc : commitBoundaryQpc;
+        if (!timeline.ProcessPacket(
+                packet,
+                false,
+                packetBoundary,
+                error,
+                maximumEncodedFrames)) {
+            return false;
+        }
+        pendingPackets.PopFront();
+    }
+    return true;
+}
+
+[[nodiscard]] bool TrimPausedPreRollToBudget(
+    PendingPacketQueue& pendingPackets,
+    AudioTimelineWriter& timeline,
+    const std::uint32_t sampleRate,
+    const std::uint32_t bytesPerFrame,
+    SystemAudioCaptureError& error) noexcept {
+    while (!pendingPackets.Empty() &&
+           pendingPackets.ExceedsBudget(sampleRate, bytesPerFrame)) {
+        if (!timeline.ProcessPacket(
+                pendingPackets.Front(),
+                true,
+                std::nullopt,
+                error)) {
+            return false;
+        }
+        pendingPackets.PopFront();
+    }
+    return true;
+}
+
 }  // namespace
+
+std::optional<SystemAudioQpcPosition>
+QuerySystemAudioQpcPosition100Nanoseconds() noexcept {
+    return QueryPerformanceCounter100Nanoseconds();
+}
 
 struct SystemAudioCapture::Impl final {
     mutable std::mutex stateMutex;
@@ -921,7 +1354,10 @@ struct SystemAudioCapture::Impl final {
     bool starting{};
     bool stopRequested{};
     bool requestedPaused{};
-    std::optional<std::chrono::nanoseconds> requestedMinimumDuration;
+    std::optional<SystemAudioQpcPosition> requestedTransitionQpc;
+    std::optional<std::chrono::nanoseconds> requestedTransitionDuration;
+    std::optional<SystemAudioQpcPosition> requestedStopQpc;
+    std::optional<std::chrono::nanoseconds> requestedExactDuration;
     std::uint64_t commandGeneration{};
     std::uint64_t appliedCommandGeneration{};
     std::optional<SystemAudioRecordingResult> completedResult;
@@ -930,6 +1366,8 @@ struct SystemAudioCapture::Impl final {
     struct ControlSnapshot final {
         bool stop{};
         bool paused{};
+        std::optional<SystemAudioQpcPosition> boundaryQpc;
+        std::optional<std::chrono::nanoseconds> exactTimelineDuration;
         std::uint64_t generation{};
     };
 
@@ -938,6 +1376,8 @@ struct SystemAudioCapture::Impl final {
         return ControlSnapshot{
             stopRequested,
             requestedPaused,
+            stopRequested ? requestedStopQpc : requestedTransitionQpc,
+            stopRequested ? requestedExactDuration : requestedTransitionDuration,
             commandGeneration,
         };
     }
@@ -974,6 +1414,8 @@ struct SystemAudioCapture::Impl final {
 
     void Run(
         const SystemAudioCaptureConfig config,
+        const std::optional<SystemAudioQpcPosition> timelineStartQpc,
+        const bool prepared,
         const SystemAudioCaptureCallbacks callbacks,
         std::promise<bool> startupResult) noexcept {
         static_cast<void>(::SetThreadDescription(
@@ -1052,8 +1494,12 @@ struct SystemAudioCapture::Impl final {
             return;
         }
 
-        const std::optional<std::uint64_t> initialSegmentQpcStart =
-            QueryPerformanceCounter100Nanoseconds();
+        const std::optional<SystemAudioQpcPosition> initialSegmentQpcStart =
+            prepared
+                ? std::nullopt
+                : timelineStartQpc.has_value()
+                    ? timelineStartQpc
+                    : QueryPerformanceCounter100Nanoseconds();
         const Clock::time_point initialSegmentStarted = Clock::now();
         const std::uint32_t bytesPerFrame =
             static_cast<std::uint32_t>(config.channelCount) *
@@ -1062,11 +1508,14 @@ struct SystemAudioCapture::Impl final {
             writer,
             config.sampleRate,
             bytesPerFrame);
-        timeline.BeginActiveSegment(initialSegmentQpcStart, 0);
+        if (!prepared) {
+            timeline.BeginActiveSegment(initialSegmentQpcStart, 0);
+        }
 
         {
             std::scoped_lock lock(stateMutex);
-            state = SystemAudioCaptureState::Capturing;
+            state = prepared ? SystemAudioCaptureState::Paused
+                             : SystemAudioCaptureState::Capturing;
             starting = false;
             appliedCommandGeneration = commandGeneration;
         }
@@ -1074,7 +1523,8 @@ struct SystemAudioCapture::Impl final {
         stateChanged.notify_all();
 
         SystemAudioCaptureError runtimeError{};
-        bool capturePaused = false;
+        bool capturePaused = prepared;
+        PendingPacketQueue pendingPackets;
         // This clock advances only while recording is active. Incremental
         // silence keeps a zero-packet recording encoded before Stop is called.
         std::chrono::nanoseconds completedActiveDuration{};
@@ -1103,35 +1553,54 @@ struct SystemAudioCapture::Impl final {
             if (control.generation != appliedCommandGeneration) {
                 if (control.paused && !capturePaused) {
                     const Clock::time_point commandTime = Clock::now();
-                    completedActiveDuration = activeDurationAt(commandTime);
-                    if (!DrainAvailablePackets(
+                    completedActiveDuration =
+                        control.exactTimelineDuration.value_or(
+                            activeDurationAt(commandTime));
+                    const std::optional<std::uint64_t> exactTargetFrames =
+                        control.exactTimelineDuration.has_value()
+                            ? std::optional<std::uint64_t>(
+                                  FramesForDurationCeiling(
+                                      *control.exactTimelineDuration,
+                                      config.sampleRate))
+                            : std::nullopt;
+                    if (!CollectAvailablePackets(
                             session,
+                            pendingPackets,
+                            runtimeError) ||
+                        !FlushPendingPackets(
+                            pendingPackets,
                             timeline,
-                            false,
-                            runtimeError)) {
+                            config.sampleRate,
+                            bytesPerFrame,
+                            true,
+                            std::nullopt,
+                            control.boundaryQpc,
+                            runtimeError,
+                            exactTargetFrames)) {
                         break;
                     }
-                    if (!timeline.EnsureMinimumDuration(
-                            completedActiveDuration,
-                            runtimeError)) {
+                    const bool segmentEnded =
+                        control.exactTimelineDuration.has_value()
+                            ? timeline.EnsureExactDuration(
+                                  *control.exactTimelineDuration,
+                                  runtimeError)
+                            : control.boundaryQpc.has_value()
+                                ? timeline.EndActiveSegment(
+                                      control.boundaryQpc,
+                                      runtimeError)
+                                : timeline.EnsureMinimumDuration(
+                                      completedActiveDuration,
+                                      runtimeError);
+                    if (!segmentEnded) {
                         break;
                     }
                     capturePaused = true;
                 } else if (!control.paused && capturePaused) {
-                    if (!DrainAvailablePackets(
-                            session,
-                            timeline,
-                            true,
-                            runtimeError)) {
-                        break;
-                    }
-                    const std::optional<std::uint64_t> segmentQpcStart =
-                        QueryPerformanceCounter100Nanoseconds();
                     const Clock::time_point commandTime = Clock::now();
                     activeSegmentStarted = commandTime;
                     capturePaused = false;
                     timeline.BeginActiveSegment(
-                        segmentQpcStart,
+                        control.boundaryQpc,
                         timeline.Stats().encodedFrames);
                 }
                 ApplyPauseCommand(capturePaused, control.generation);
@@ -1151,12 +1620,38 @@ struct SystemAudioCapture::Impl final {
                 break;
             }
 
-            if (!DrainAvailablePackets(
-                    session,
-                    timeline,
-                    capturePaused,
-                    runtimeError)) {
-                break;
+            if (capturePaused) {
+                if (!CollectAvailablePackets(
+                        session,
+                        pendingPackets,
+                        runtimeError) ||
+                    !TrimPausedPreRollToBudget(
+                        pendingPackets,
+                        timeline,
+                        config.sampleRate,
+                        bytesPerFrame,
+                        runtimeError)) {
+                    break;
+                }
+            } else {
+                if (!CollectAvailablePackets(
+                        session,
+                        pendingPackets,
+                        runtimeError)) {
+                    break;
+                }
+                if (!capturePaused &&
+                    !FlushPendingPackets(
+                        pendingPackets,
+                        timeline,
+                        config.sampleRate,
+                        bytesPerFrame,
+                        false,
+                        MaturePacketBoundaryQpc(),
+                        std::nullopt,
+                        runtimeError)) {
+                    break;
+                }
             }
 
             const Clock::time_point now = Clock::now();
@@ -1185,26 +1680,48 @@ struct SystemAudioCapture::Impl final {
                 nativeResult);
         }
 
-        if (!runtimeError) {
-            static_cast<void>(DrainAvailablePackets(
-                session,
-                timeline,
-                capturePaused,
-                runtimeError));
-        }
-
-        std::optional<std::chrono::nanoseconds> minimumDuration;
+        std::optional<SystemAudioQpcPosition> stopBoundaryQpc;
+        std::optional<std::chrono::nanoseconds> exactDuration;
         {
             std::scoped_lock lock(stateMutex);
-            minimumDuration = requestedMinimumDuration;
+            stopBoundaryQpc = requestedStopQpc;
+            exactDuration = requestedExactDuration;
+        }
+        if (!runtimeError) {
+            if (capturePaused) {
+                pendingPackets.Clear();
+                static_cast<void>(DrainAvailablePackets(
+                    session,
+                    timeline,
+                    true,
+                    runtimeError));
+            } else if (CollectAvailablePackets(
+                           session,
+                           pendingPackets,
+                           runtimeError)) {
+                static_cast<void>(FlushPendingPackets(
+                    pendingPackets,
+                    timeline,
+                    config.sampleRate,
+                    bytesPerFrame,
+                    true,
+                    std::nullopt,
+                    stopBoundaryQpc,
+                    runtimeError,
+                    exactDuration.has_value()
+                        ? std::optional<std::uint64_t>(
+                              FramesForDurationCeiling(
+                                  *exactDuration,
+                                  config.sampleRate))
+                        : std::nullopt));
+            }
         }
         if (!runtimeError) {
             const std::chrono::nanoseconds targetDuration =
-                minimumDuration.value_or(activeDurationAt(Clock::now()));
-            static_cast<void>(timeline.EnsureMinimumDuration(
+                exactDuration.value_or(activeDurationAt(Clock::now()));
+            static_cast<void>(timeline.EnsureExactDuration(
                 targetDuration,
-                runtimeError,
-                true));
+                runtimeError));
         }
 
         SystemAudioCaptureError finalizeError{};
@@ -1219,6 +1736,16 @@ struct SystemAudioCapture::Impl final {
         }
 
         const SystemAudioCaptureStats finalStats = timeline.Stats();
+        const std::uint64_t minimumUsableAacFrames =
+            static_cast<std::uint64_t>(config.sampleRate) *
+            kMinimumAacSeedMilliseconds / 1'000U;
+        if (!runtimeError &&
+            finalStats.encodedFrames < minimumUsableAacFrames) {
+            runtimeError = MakeError(
+                SystemAudioCaptureErrorCode::FinalizeFailed,
+                L"录制时间过短，系统音轨不足以生成可用的 AAC 文件。",
+                static_cast<long>(E_FAIL));
+        }
         std::optional<SystemAudioRecordingResult> result;
         if (!runtimeError) {
             result = SystemAudioRecordingResult{
@@ -1242,6 +1769,10 @@ struct SystemAudioCapture::Impl final {
             terminalError = runtimeError;
             stopRequested = false;
             requestedPaused = false;
+            requestedTransitionQpc.reset();
+            requestedTransitionDuration.reset();
+            requestedStopQpc.reset();
+            requestedExactDuration.reset();
             starting = false;
             state = SystemAudioCaptureState::Idle;
         }
@@ -1264,6 +1795,45 @@ SystemAudioCapture::~SystemAudioCapture() {
 
 bool SystemAudioCapture::Start(
     const SystemAudioCaptureConfig& config,
+    SystemAudioCaptureCallbacks callbacks,
+    SystemAudioCaptureError* error) {
+    return StartInternal(
+        config,
+        std::nullopt,
+        false,
+        std::move(callbacks),
+        error);
+}
+
+bool SystemAudioCapture::Start(
+    const SystemAudioCaptureConfig& config,
+    const std::optional<SystemAudioQpcPosition> timelineStartQpc,
+    SystemAudioCaptureCallbacks callbacks,
+    SystemAudioCaptureError* error) {
+    return StartInternal(
+        config,
+        timelineStartQpc,
+        false,
+        std::move(callbacks),
+        error);
+}
+
+bool SystemAudioCapture::StartPrepared(
+    const SystemAudioCaptureConfig& config,
+    SystemAudioCaptureCallbacks callbacks,
+    SystemAudioCaptureError* error) {
+    return StartInternal(
+        config,
+        std::nullopt,
+        true,
+        std::move(callbacks),
+        error);
+}
+
+bool SystemAudioCapture::StartInternal(
+    const SystemAudioCaptureConfig& config,
+    const std::optional<SystemAudioQpcPosition> timelineStartQpc,
+    const bool prepared,
     SystemAudioCaptureCallbacks callbacks,
     SystemAudioCaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
@@ -1316,8 +1886,11 @@ bool SystemAudioCapture::Start(
         impl_->completedResult.reset();
         impl_->terminalError = {};
         impl_->stopRequested = false;
-        impl_->requestedPaused = false;
-        impl_->requestedMinimumDuration.reset();
+        impl_->requestedPaused = prepared;
+        impl_->requestedTransitionQpc.reset();
+        impl_->requestedTransitionDuration.reset();
+        impl_->requestedStopQpc.reset();
+        impl_->requestedExactDuration.reset();
         impl_->commandGeneration = 0;
         impl_->appliedCommandGeneration = 0;
         impl_->starting = true;
@@ -1329,10 +1902,14 @@ bool SystemAudioCapture::Start(
         impl_->worker = std::thread(
             [implementation = impl_.get(),
              config,
+             timelineStartQpc,
+             prepared,
              callbacks = std::move(callbacks),
              promise = std::move(startupPromise)]() mutable {
                 implementation->Run(
                     config,
+                    timelineStartQpc,
+                    prepared,
                     callbacks,
                     std::move(promise));
             });
@@ -1378,6 +1955,32 @@ bool SystemAudioCapture::Start(
 }
 
 bool SystemAudioCapture::Pause(SystemAudioCaptureError* error) {
+    return PauseInternal(
+        QuerySystemAudioQpcPosition100Nanoseconds(),
+        std::nullopt,
+        error);
+}
+
+bool SystemAudioCapture::Pause(
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    SystemAudioCaptureError* error) {
+    return PauseInternal(boundaryQpc, std::nullopt, error);
+}
+
+bool SystemAudioCapture::Pause(
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    const std::chrono::nanoseconds exactTimelineDuration,
+    SystemAudioCaptureError* error) {
+    return PauseInternal(
+        boundaryQpc,
+        std::max(exactTimelineDuration, std::chrono::nanoseconds::zero()),
+        error);
+}
+
+bool SystemAudioCapture::PauseInternal(
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    const std::optional<std::chrono::nanoseconds> exactTimelineDuration,
+    SystemAudioCaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
     if (impl_->worker.joinable() &&
@@ -1401,6 +2004,8 @@ bool SystemAudioCapture::Pause(SystemAudioCaptureError* error) {
         return false;
     }
 
+    impl_->requestedTransitionQpc = boundaryQpc;
+    impl_->requestedTransitionDuration = exactTimelineDuration;
     impl_->requestedPaused = true;
     const std::uint64_t generation = ++impl_->commandGeneration;
     static_cast<void>(::SetEvent(impl_->controlEvent.Get()));
@@ -1417,6 +2022,12 @@ bool SystemAudioCapture::Pause(SystemAudioCaptureError* error) {
 }
 
 bool SystemAudioCapture::Resume(SystemAudioCaptureError* error) {
+    return Resume(QuerySystemAudioQpcPosition100Nanoseconds(), error);
+}
+
+bool SystemAudioCapture::Resume(
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    SystemAudioCaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
     if (impl_->worker.joinable() &&
@@ -1440,6 +2051,8 @@ bool SystemAudioCapture::Resume(SystemAudioCaptureError* error) {
         return false;
     }
 
+    impl_->requestedTransitionQpc = boundaryQpc;
+    impl_->requestedTransitionDuration.reset();
     impl_->requestedPaused = false;
     const std::uint64_t generation = ++impl_->commandGeneration;
     static_cast<void>(::SetEvent(impl_->controlEvent.Get()));
@@ -1457,19 +2070,34 @@ bool SystemAudioCapture::Resume(SystemAudioCaptureError* error) {
 
 std::optional<SystemAudioRecordingResult> SystemAudioCapture::Stop(
     SystemAudioCaptureError* error) {
-    return StopInternal(std::nullopt, error);
+    return StopInternal(
+        QuerySystemAudioQpcPosition100Nanoseconds(),
+        std::nullopt,
+        error);
 }
 
 std::optional<SystemAudioRecordingResult> SystemAudioCapture::Stop(
     const std::chrono::nanoseconds minimumDuration,
     SystemAudioCaptureError* error) {
     return StopInternal(
+        QuerySystemAudioQpcPosition100Nanoseconds(),
         std::max(minimumDuration, std::chrono::nanoseconds::zero()),
         error);
 }
 
+std::optional<SystemAudioRecordingResult> SystemAudioCapture::Stop(
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    const std::chrono::nanoseconds exactDuration,
+    SystemAudioCaptureError* error) {
+    return StopInternal(
+        boundaryQpc,
+        std::max(exactDuration, std::chrono::nanoseconds::zero()),
+        error);
+}
+
 std::optional<SystemAudioRecordingResult> SystemAudioCapture::StopInternal(
-    const std::optional<std::chrono::nanoseconds> minimumDuration,
+    const std::optional<SystemAudioQpcPosition> boundaryQpc,
+    const std::optional<std::chrono::nanoseconds> exactDuration,
     SystemAudioCaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
@@ -1477,11 +2105,8 @@ std::optional<SystemAudioRecordingResult> SystemAudioCapture::StopInternal(
     {
         std::scoped_lock lock(impl_->stateMutex);
         if (impl_->state != SystemAudioCaptureState::Idle || impl_->starting) {
-            if (minimumDuration.has_value() &&
-                (!impl_->requestedMinimumDuration.has_value() ||
-                 *minimumDuration > *impl_->requestedMinimumDuration)) {
-                impl_->requestedMinimumDuration = minimumDuration;
-            }
+            impl_->requestedStopQpc = boundaryQpc;
+            impl_->requestedExactDuration = exactDuration;
             impl_->stopRequested = true;
             impl_->state = SystemAudioCaptureState::Finalizing;
             static_cast<void>(::SetEvent(impl_->controlEvent.Get()));

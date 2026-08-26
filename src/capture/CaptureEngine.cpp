@@ -156,6 +156,14 @@ struct CaptureEngine::Impl final {
     CaptureError terminalError{};
     std::wstring systemAudioDiagnostic;
     bool systemAudioReliable{};
+    bool systemAudioTimelineActivating{};
+    bool systemAudioTimelineStarted{};
+    bool videoTimelineStarted{};
+    std::uint64_t pauseRequestGeneration{};
+    std::uint64_t pauseAcknowledgedGeneration{};
+    std::optional<SystemAudioQpcPosition> pauseBoundaryQpc;
+    std::int64_t pauseTimelineDuration100Nanoseconds{};
+    std::optional<SystemAudioQpcPosition> stopBoundaryQpc;
 
     [[nodiscard]] RecordingStats CurrentStatsUnlocked() const noexcept {
         RecordingStats current = stats;
@@ -285,7 +293,7 @@ struct CaptureEngine::Impl final {
             StoreSystemAudioDiagnostic(
                 L"未捕获到电脑声音：" + SystemAudioErrorText(audioError));
         };
-        const bool systemAudioStarted = systemAudioCapture.Start(
+        const bool systemAudioStarted = systemAudioCapture.StartPrepared(
             SystemAudioCaptureConfig{
                 systemAudioPath,
                 48'000,
@@ -312,6 +320,7 @@ struct CaptureEngine::Impl final {
             pauseStarted = {};
             accumulatedPause = Clock::duration::zero();
             stats = {};
+            systemAudioTimelineActivating = systemAudioStarted;
             state = RecordingState::Recording;
             starting = false;
         }
@@ -338,6 +347,15 @@ struct CaptureEngine::Impl final {
                     nextStatsCallback = nextFrameDeadline;
                 }
                 if (pauseRequested && !stopRequested) {
+                    if (pauseAcknowledgedGeneration < pauseRequestGeneration) {
+                        pauseBoundaryQpc =
+                            QuerySystemAudioQpcPosition100Nanoseconds();
+                        pauseTimelineDuration100Nanoseconds =
+                            encodedDuration100Nanoseconds;
+                        pauseStarted = Clock::now();
+                        pauseAcknowledgedGeneration = pauseRequestGeneration;
+                        stateChanged.notify_all();
+                    }
                     stateChanged.wait(lock, [this] {
                         return stopRequested || !pauseRequested;
                     });
@@ -419,6 +437,11 @@ struct CaptureEngine::Impl final {
                 timelineFrameIndex + 1,
                 config.framesPerSecond);
             const std::int64_t sampleDuration = sampleEnd - timestamp;
+            const bool firstVideoFrame = timelineFrameIndex == 0;
+            const std::optional<SystemAudioQpcPosition> frameBoundaryQpc =
+                firstVideoFrame
+                    ? QuerySystemAudioQpcPosition100Nanoseconds()
+                    : std::nullopt;
             if (!writer.WriteBgraFrame(
                     latestFrame.bgra,
                     latestFrame.stride,
@@ -433,6 +456,28 @@ struct CaptureEngine::Impl final {
                 break;
             }
 
+            if (firstVideoFrame && systemAudioStarted) {
+                {
+                    std::scoped_lock lock(stateMutex);
+                    systemAudioTimelineActivating = true;
+                }
+                SystemAudioCaptureError audioError;
+                const bool audioTimelineStarted = systemAudioCapture.Resume(
+                        frameBoundaryQpc,
+                        &audioError);
+                {
+                    std::scoped_lock lock(stateMutex);
+                    systemAudioTimelineActivating = false;
+                    systemAudioTimelineStarted = audioTimelineStarted;
+                }
+                stateChanged.notify_all();
+                if (!audioTimelineStarted) {
+                    StoreSystemAudioDiagnostic(
+                        L"电脑声音首帧同步失败：" +
+                        SystemAudioErrorText(audioError));
+                }
+            }
+
             encodedDuration100Nanoseconds = sampleEnd;
             ++timelineFrameIndex;
             RecordingStats statsSnapshot{};
@@ -441,7 +486,11 @@ struct CaptureEngine::Impl final {
                 ++stats.encodedFrames;
                 stats.activeDuration = std::chrono::milliseconds(
                     encodedDuration100Nanoseconds / 10'000);
+                videoTimelineStarted = true;
                 statsSnapshot = stats;
+            }
+            if (firstVideoFrame) {
+                stateChanged.notify_all();
             }
 
             nextFrameDeadline += framePeriod;
@@ -473,8 +522,18 @@ struct CaptureEngine::Impl final {
             const auto videoTimelineDuration =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     MediaFoundationDuration(encodedDuration100Nanoseconds));
+            std::optional<SystemAudioQpcPosition> audioStopBoundaryQpc;
+            {
+                std::scoped_lock lock(stateMutex);
+                audioStopBoundaryQpc = stopBoundaryQpc;
+            }
+            if (!audioStopBoundaryQpc.has_value()) {
+                audioStopBoundaryQpc =
+                    QuerySystemAudioQpcPosition100Nanoseconds();
+            }
             const std::optional<SystemAudioRecordingResult> audioResult =
                 systemAudioCapture.Stop(
+                    audioStopBoundaryQpc,
                     videoTimelineDuration,
                     &systemAudioStopError);
             bool audioReliable = false;
@@ -545,6 +604,14 @@ struct CaptureEngine::Impl final {
             terminalError = runtimeError;
             pauseRequested = false;
             stopRequested = false;
+            systemAudioTimelineActivating = false;
+            systemAudioTimelineStarted = false;
+            videoTimelineStarted = false;
+            pauseRequestGeneration = 0;
+            pauseAcknowledgedGeneration = 0;
+            pauseBoundaryQpc.reset();
+            pauseTimelineDuration100Nanoseconds = 0;
+            stopBoundaryQpc.reset();
             starting = false;
             state = RecordingState::Idle;
         }
@@ -617,6 +684,14 @@ bool CaptureEngine::Start(
         impl_->terminalError = {};
         impl_->systemAudioDiagnostic.clear();
         impl_->systemAudioReliable = false;
+        impl_->systemAudioTimelineActivating = false;
+        impl_->systemAudioTimelineStarted = false;
+        impl_->videoTimelineStarted = false;
+        impl_->pauseRequestGeneration = 0;
+        impl_->pauseAcknowledgedGeneration = 0;
+        impl_->pauseBoundaryQpc.reset();
+        impl_->pauseTimelineDuration100Nanoseconds = 0;
+        impl_->stopBoundaryQpc.reset();
         impl_->stopRequested = false;
         impl_->pauseRequested = false;
         impl_->resumeGeneration = 0;
@@ -675,9 +750,22 @@ bool CaptureEngine::Start(
 }
 
 bool CaptureEngine::Pause(CaptureError* error) {
+    std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
+    if (impl_->worker.joinable() &&
+        impl_->worker.get_id() == std::this_thread::get_id()) {
+        AssignError(
+            error,
+            MakeError(
+                CaptureErrorCode::InvalidState,
+                L"录制回调线程不能同步暂停自身。"));
+        return false;
+    }
+    std::optional<SystemAudioQpcPosition> boundaryQpc;
+    std::chrono::nanoseconds exactTimelineDuration{};
+    bool pauseSystemAudio = false;
     {
-        std::scoped_lock lock(impl_->stateMutex);
+        std::unique_lock lock(impl_->stateMutex);
         if (impl_->state != RecordingState::Recording || impl_->pauseRequested) {
             AssignError(
                 error,
@@ -685,16 +773,65 @@ bool CaptureEngine::Pause(CaptureError* error) {
             return false;
         }
 
+        // Start() 可以在首个桌面帧到达前返回。先等首帧视频提交及
+        // 预备态音频激活，避免立即暂停把录制永久挡在零帧状态。
+        impl_->stateChanged.wait(lock, [this] {
+            return (impl_->videoTimelineStarted &&
+                    !impl_->systemAudioTimelineActivating) ||
+                impl_->stopRequested ||
+                impl_->state == RecordingState::Idle;
+        });
+        if (impl_->stopRequested ||
+            impl_->state != RecordingState::Recording ||
+            impl_->pauseRequested) {
+            AssignError(
+                error,
+                MakeError(CaptureErrorCode::InvalidState, L"当前录制状态不能暂停。"));
+            return false;
+        }
+
+        const std::uint64_t requestGeneration =
+            ++impl_->pauseRequestGeneration;
         impl_->pauseRequested = true;
-        impl_->pauseStarted = Clock::now();
         impl_->state = RecordingState::Paused;
         impl_->stateChanged.notify_all();
+
+        // 捕获线程在帧写入边界确认暂停，并同时发布共享 QPC 与已经
+        // 提交的视频时长。音频必须封口到该离散视频时间线，不能只按
+        // 墙钟 QPC 推导，否则每次暂停都会累积最多一帧的偏移。
+        impl_->stateChanged.wait(lock, [this, requestGeneration] {
+            return impl_->pauseAcknowledgedGeneration >= requestGeneration ||
+                impl_->stopRequested ||
+                impl_->state == RecordingState::Idle;
+        });
+        if (impl_->pauseAcknowledgedGeneration < requestGeneration ||
+            impl_->stopRequested ||
+            impl_->state == RecordingState::Idle) {
+            AssignError(
+                error,
+                MakeError(
+                    CaptureErrorCode::InvalidState,
+                    L"录制线程未能确认暂停边界。"));
+            return false;
+        }
+
+        boundaryQpc = impl_->pauseBoundaryQpc;
+        using MediaFoundationDuration =
+            std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
+        exactTimelineDuration =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                MediaFoundationDuration(
+                    impl_->pauseTimelineDuration100Nanoseconds));
+        pauseSystemAudio = impl_->systemAudioTimelineStarted;
     }
 
-    if (impl_->systemAudioCapture.State() ==
+    if (pauseSystemAudio && impl_->systemAudioCapture.State() ==
         SystemAudioCaptureState::Capturing) {
         SystemAudioCaptureError audioError;
-        if (!impl_->systemAudioCapture.Pause(&audioError)) {
+        if (!impl_->systemAudioCapture.Pause(
+                boundaryQpc,
+                exactTimelineDuration,
+                &audioError)) {
             impl_->StoreSystemAudioDiagnostic(
                 L"电脑声音暂停同步失败：" + SystemAudioErrorText(audioError));
         }
@@ -703,7 +840,11 @@ bool CaptureEngine::Pause(CaptureError* error) {
 }
 
 bool CaptureEngine::Resume(CaptureError* error) {
+    std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
+    const std::optional<SystemAudioQpcPosition> boundaryQpc =
+        QuerySystemAudioQpcPosition100Nanoseconds();
+    bool resumeSystemAudio = false;
     {
         std::scoped_lock lock(impl_->stateMutex);
         if (impl_->state != RecordingState::Paused || !impl_->pauseRequested) {
@@ -712,23 +853,21 @@ bool CaptureEngine::Resume(CaptureError* error) {
                 MakeError(CaptureErrorCode::InvalidState, L"当前录制状态不能继续。"));
             return false;
         }
-    }
-
-    if (impl_->systemAudioCapture.State() == SystemAudioCaptureState::Paused) {
-        SystemAudioCaptureError audioError;
-        if (!impl_->systemAudioCapture.Resume(&audioError)) {
-            impl_->StoreSystemAudioDiagnostic(
-                L"电脑声音继续同步失败：" + SystemAudioErrorText(audioError));
-        }
-    }
-
-    {
-        std::scoped_lock lock(impl_->stateMutex);
         impl_->accumulatedPause += Clock::now() - impl_->pauseStarted;
         impl_->pauseRequested = false;
         ++impl_->resumeGeneration;
         impl_->state = RecordingState::Recording;
+        resumeSystemAudio = impl_->systemAudioTimelineStarted;
         impl_->stateChanged.notify_all();
+    }
+
+    if (resumeSystemAudio &&
+        impl_->systemAudioCapture.State() == SystemAudioCaptureState::Paused) {
+        SystemAudioCaptureError audioError;
+        if (!impl_->systemAudioCapture.Resume(boundaryQpc, &audioError)) {
+            impl_->StoreSystemAudioDiagnostic(
+                L"电脑声音继续同步失败：" + SystemAudioErrorText(audioError));
+        }
     }
     return true;
 }
@@ -736,13 +875,19 @@ bool CaptureEngine::Resume(CaptureError* error) {
 std::optional<RecordingResult> CaptureEngine::Stop(CaptureError* error) {
     std::scoped_lock lifecycleLock(impl_->lifecycleMutex);
     ClearError(error);
+    const std::optional<SystemAudioQpcPosition> boundaryQpc =
+        QuerySystemAudioQpcPosition100Nanoseconds();
 
     {
         std::scoped_lock lock(impl_->stateMutex);
         if (impl_->state != RecordingState::Idle || impl_->starting) {
-            if (impl_->pauseRequested) {
+            if (impl_->pauseRequested &&
+                impl_->pauseStarted != Clock::time_point{} &&
+                impl_->pauseAcknowledgedGeneration >=
+                    impl_->pauseRequestGeneration) {
                 impl_->accumulatedPause += Clock::now() - impl_->pauseStarted;
             }
+            impl_->stopBoundaryQpc = boundaryQpc;
             impl_->pauseRequested = false;
             impl_->stopRequested = true;
             impl_->state = RecordingState::Finalizing;
