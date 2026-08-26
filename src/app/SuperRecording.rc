@@ -5,8 +5,8 @@
 IDI_SUPER_RECORDING ICON "assets\\SuperRecording.ico"
 
 1 VERSIONINFO
- FILEVERSION 1,4,1,0
- PRODUCTVERSION 1,4,1,0
+ FILEVERSION 1,5,0,0
+ PRODUCTVERSION 1,5,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -23,11 +23,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Sun Daozhang Tools\0"
             VALUE "FileDescription", "SuperRecording - 高画质区域录屏\0"
-            VALUE "FileVersion", "1.4.1.0\0"
+            VALUE "FileVersion", "1.5.0.0\0"
             VALUE "InternalName", "SuperRecording\0"
             VALUE "OriginalFilename", "SuperRecording.exe\0"
             VALUE "ProductName", "SuperRecording\0"
-            VALUE "ProductVersion", "1.4.1.0\0"
+            VALUE "ProductVersion", "1.5.0.0\0"
         END
     END
     BLOCK "VarFileInfo"
