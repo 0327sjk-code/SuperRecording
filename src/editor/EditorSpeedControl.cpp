@@ -1,6 +1,7 @@
 #include "editor/EditorSpeedControl.h"
 
 #include "editor/EditorTheme.h"
+#include "media/ExportQuality.h"
 #include "ui/AntiAliasedDrawing.h"
 #include "ui/Theme.h"
 
@@ -20,7 +21,6 @@ namespace qrec {
 namespace {
 
 constexpr wchar_t kSpeedControlClassName[] = L"SuperRecording.EditorSpeedControl";
-constexpr wchar_t kVisibleLabel[] = L"倍速";
 constexpr UINT_PTR kMotionTimerId = 0x6B21;
 constexpr UINT kMotionFrameMilliseconds = 16;
 constexpr auto kHoverEnterDuration = std::chrono::milliseconds(150);
@@ -192,13 +192,28 @@ bool EditorSpeedControl::Create(
     const int controlId,
     HINSTANCE instance,
     ChangedCallback changed) {
+    return Create(
+        parent,
+        controlId,
+        instance,
+        EditorSliderPresentation::PlaybackSpeed,
+        std::move(changed));
+}
+
+bool EditorSpeedControl::Create(
+    const HWND parent,
+    const int controlId,
+    HINSTANCE instance,
+    const EditorSliderPresentation presentation,
+    ChangedCallback changed) {
     const int desiredValue = valueTenths_;
     const bool desiredEnabled = enabled_;
     Destroy();
-    valueTenths_ = std::clamp(
-        desiredValue,
-        MinimumSpeedTenths,
-        MaximumSpeedTenths);
+    presentation_ = presentation;
+    valueTenths_ = SnapValue(
+        presentation_ == EditorSliderPresentation::QualityPercent
+            ? media::ExportQuality::DefaultPercent
+            : desiredValue);
     enabled_ = desiredEnabled;
     changedCallback_ = std::move(changed);
 
@@ -219,7 +234,7 @@ bool EditorSpeedControl::Create(
     window_ = ::CreateWindowExW(
         0,
         kSpeedControlClassName,
-        L"播放与输出倍速，1.0 倍",
+        L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
         0,
         0,
@@ -284,10 +299,11 @@ void EditorSpeedControl::SetEnabled(const bool enabled) noexcept {
 }
 
 void EditorSpeedControl::SetValueTenths(const int speedTenths) noexcept {
-    const int clamped = std::clamp(
-        speedTenths,
-        MinimumSpeedTenths,
-        MaximumSpeedTenths);
+    SetValue(speedTenths);
+}
+
+void EditorSpeedControl::SetValue(const int value) noexcept {
+    const int clamped = SnapValue(value);
     if (clamped == valueTenths_) {
         return;
     }
@@ -458,13 +474,13 @@ LRESULT EditorSpeedControl::HandleMessage(
         }
         int requestedValue = valueTenths_;
         if (wParam == VK_LEFT || wParam == VK_DOWN) {
-            --requestedValue;
+            requestedValue -= ValueStep();
         } else if (wParam == VK_RIGHT || wParam == VK_UP) {
-            ++requestedValue;
+            requestedValue += ValueStep();
         } else if (wParam == VK_HOME) {
-            requestedValue = MinimumSpeedTenths;
+            requestedValue = MinimumValue();
         } else if (wParam == VK_END) {
-            requestedValue = MaximumSpeedTenths;
+            requestedValue = MaximumValue();
         } else {
             break;
         }
@@ -580,10 +596,14 @@ void EditorSpeedControl::DrawContent(const HDC dc, const RECT& client) const {
         client.top,
         client.left + ScaleForWindow(window_, 42),
         client.bottom};
+    const std::wstring_view visibleLabel =
+        presentation_ == EditorSliderPresentation::QualityPercent
+        ? L"画质"
+        : L"倍速";
     DrawTextBlock(
         dc,
         labelBounds,
-        kVisibleLabel,
+        visibleLabel,
         labelFont_,
         labelColor,
         DT_LEFT);
@@ -665,7 +685,10 @@ void EditorSpeedControl::DrawContent(const HDC dc, const RECT& client) const {
         }
     }
 
-    const std::wstring valueText = std::format(L"{:.1f}×", valueTenths_ / 10.0);
+    const std::wstring valueText =
+        presentation_ == EditorSliderPresentation::QualityPercent
+        ? std::format(L"{}%", valueTenths_)
+        : std::format(L"{:.1f}×", valueTenths_ / 10.0);
     RECT valueBounds{
         track.right + ScaleForWindow(window_, 7),
         client.top,
@@ -801,23 +824,22 @@ int EditorSpeedControl::ValueFromClientX(const int x) const noexcept {
         static_cast<double>(x - track.left) / static_cast<double>(width),
         0.0,
         1.0);
-    return MinimumSpeedTenths + static_cast<int>(std::lround(
-        ratio * static_cast<double>(MaximumSpeedTenths - MinimumSpeedTenths)));
+    const int step = ValueStep();
+    const int stepCount = std::max(1, (MaximumValue() - MinimumValue()) / step);
+    return MinimumValue() + static_cast<int>(std::lround(
+        ratio * static_cast<double>(stepCount))) * step;
 }
 
 int EditorSpeedControl::ThumbCenterX() const noexcept {
     const RECT track = TrackBounds();
-    const double ratio = static_cast<double>(valueTenths_ - MinimumSpeedTenths) /
-        static_cast<double>(MaximumSpeedTenths - MinimumSpeedTenths);
+    const double ratio = static_cast<double>(valueTenths_ - MinimumValue()) /
+        static_cast<double>(MaximumValue() - MinimumValue());
     return track.left + static_cast<int>(std::lround(
         ratio * static_cast<double>(track.right - track.left)));
 }
 
-bool EditorSpeedControl::ApplyUserValue(const int speedTenths) {
-    const int clamped = std::clamp(
-        speedTenths,
-        MinimumSpeedTenths,
-        MaximumSpeedTenths);
+bool EditorSpeedControl::ApplyUserValue(const int value) {
+    const int clamped = SnapValue(value);
     if (clamped == valueTenths_) {
         return false;
     }
@@ -825,7 +847,7 @@ bool EditorSpeedControl::ApplyUserValue(const int speedTenths) {
     UpdateAccessibleText();
     ::InvalidateRect(window_, nullptr, FALSE);
     if (changedCallback_) {
-        changedCallback_(valueTenths_, EditorSpeedInteractionPhase::Preview);
+        changedCallback_(valueTenths_, EditorSliderInteractionPhase::Preview);
     }
     return true;
 }
@@ -836,7 +858,7 @@ void EditorSpeedControl::CommitInteraction() {
     }
     interactionChanged_ = false;
     if (changedCallback_) {
-        changedCallback_(valueTenths_, EditorSpeedInteractionPhase::Committed);
+        changedCallback_(valueTenths_, EditorSliderInteractionPhase::Committed);
     }
 }
 
@@ -844,15 +866,49 @@ void EditorSpeedControl::UpdateAccessibleText() noexcept {
     if (window_ == nullptr) {
         return;
     }
-    const std::wstring accessibleName = std::format(
-        L"播放与输出倍速，{:.1f} 倍。方向键按 0.1 倍调整",
-        valueTenths_ / 10.0);
+    const std::wstring accessibleName =
+        presentation_ == EditorSliderPresentation::QualityPercent
+        ? std::format(
+            L"预览与输出画质，{}%。方向键按 {}% 调整",
+            valueTenths_,
+            media::ExportQuality::StepPercent)
+        : std::format(
+            L"播放与输出倍速，{:.1f} 倍。方向键按 0.1 倍调整",
+            valueTenths_ / 10.0);
     ::SetWindowTextW(window_, accessibleName.c_str());
     ::NotifyWinEvent(
         EVENT_OBJECT_NAMECHANGE,
         window_,
         OBJID_CLIENT,
         CHILDID_SELF);
+}
+
+int EditorSpeedControl::MinimumValue() const noexcept {
+    return presentation_ == EditorSliderPresentation::QualityPercent
+        ? media::ExportQuality::MinimumPercent
+        : MinimumSpeedTenths;
+}
+
+int EditorSpeedControl::MaximumValue() const noexcept {
+    return presentation_ == EditorSliderPresentation::QualityPercent
+        ? media::ExportQuality::MaximumPercent
+        : MaximumSpeedTenths;
+}
+
+int EditorSpeedControl::ValueStep() const noexcept {
+    return presentation_ == EditorSliderPresentation::QualityPercent
+        ? media::ExportQuality::StepPercent
+        : 1;
+}
+
+int EditorSpeedControl::SnapValue(const int value) const noexcept {
+    const int minimum = MinimumValue();
+    const int maximum = MaximumValue();
+    const int step = ValueStep();
+    const int clamped = std::clamp(value, minimum, maximum);
+    const int snapped = minimum +
+        ((clamped - minimum + step / 2) / step) * step;
+    return std::clamp(snapped, minimum, maximum);
 }
 
 void EditorSpeedControl::SetHoverState(const bool hovered) noexcept {

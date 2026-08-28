@@ -10,6 +10,7 @@
 #include "editor/MediaPreview.h"
 #include "editor/TrimTimeline.h"
 #include "editor/WarmCacheCoordinator.h"
+#include "media/ExportQuality.h"
 #include "media/Mp4BoundaryEncoderPool.h"
 #include "media/MediaExporter.h"
 #include "ui/Motion.h"
@@ -42,6 +43,7 @@ constexpr UINT_PTR kPlaybackTimer = 1;
 constexpr UINT_PTR kTimelineSeekTimer = 2;
 constexpr UINT_PTR kWarmCacheDebounceTimer = 3;
 constexpr UINT_PTR kTimelineInteractionTimer = 4;
+constexpr UINT_PTR kPreviewProxyDebounceTimer = 5;
 constexpr UINT kPlaybackRefreshMilliseconds = 16;
 constexpr UINT kTimelineInteractionFrameMilliseconds = 16;
 constexpr auto kPlaybackTextRefreshInterval = std::chrono::milliseconds(33);
@@ -50,6 +52,8 @@ constexpr auto kProgressUiInterval = std::chrono::milliseconds(100);
 constexpr UINT kWarmCacheMp4DebounceMilliseconds = 16;
 constexpr UINT kWarmCacheGifDebounceMilliseconds = 350;
 constexpr UINT kWarmCacheSpeedDebounceMilliseconds = 250;
+constexpr UINT kWarmCacheQualityDebounceMilliseconds = 250;
+constexpr UINT kPreviewProxyDebounceMilliseconds = 250;
 constexpr UINT_PTR kFormatButtonSubclassId = 0x7201;
 constexpr UINT kExportProgressMessage = WM_APP + 0x231;
 constexpr UINT kExportCompletedMessage = WM_APP + 0x232;
@@ -57,6 +61,7 @@ constexpr UINT kWarmCacheProgressMessage = WM_APP + 0x233;
 constexpr UINT kWarmCacheCompletedMessage = WM_APP + 0x234;
 constexpr UINT kDeferredEditorCommandMessage = WM_APP + 0x23A;
 constexpr UINT kRefreshPreviewVideoMessage = WM_APP + 0x23B;
+constexpr UINT kPreviewProxyCompletedMessage = WM_APP + 0x23C;
 
 constexpr int kPreviewId = 1001;
 constexpr int kTimelineId = 1002;
@@ -75,6 +80,8 @@ constexpr int kAudioToggleId = 1014;
 constexpr int kSpeedControlId = 1015;
 constexpr int kTrimStartButtonId = 1016;
 constexpr int kTrimEndButtonId = 1017;
+constexpr int kQualityControlId = 1018;
+constexpr int kOutputSizeTextId = 1019;
 
 constexpr wchar_t kTrimStartAccessibleName[] = L"设为起点";
 constexpr wchar_t kTrimEndAccessibleName[] = L"设为终点";
@@ -123,6 +130,11 @@ struct WarmCacheProgressState final {
 struct WarmCacheResultState final {
     std::uint64_t generation{};
     MediaExportResult result;
+};
+
+struct PreviewReloadState final {
+    std::chrono::milliseconds position{};
+    bool resumePlayback{};
 };
 
 int Scale(const HWND window, const int value) noexcept {
@@ -201,6 +213,7 @@ public:
         CloseForShutdown();
         DiscardBoundaryEncoderPreparation();
         StopWarmCacheAndWait();
+        StopPreviewProxyAndWait();
         exporter_.CancelAndWait();
     }
 
@@ -254,8 +267,18 @@ public:
         trimEnd_ = duration_;
         trimRangeEdited_ = false;
         playbackSpeedTenths_ = EditorSpeedControl::DefaultSpeedTenths;
+        qualityPercent_ = media::ExportQuality::Normalize(
+            settings_.outputQualityPercent);
+        settings_.outputQualityPercent = qualityPercent_;
+        estimatedOutputBytes_ = 0;
+        exactOutputBytes_ = 0;
+        outputSizeExact_ = false;
+        displayedOutputSizeText_.clear();
         mediaItemReady_ = false;
         speedInteractionActive_ = false;
+        qualityInteractionActive_ = false;
+        activePreviewPath_.clear();
+        previewReloadState_.reset();
         WriteDiagnostic(std::format(
             L"编辑器打开：format=MP4，trimStart={} ms，trimEnd={} ms，duration={} ms，"
             L"recordingDuration={} ms，trimRangeEdited=否",
@@ -293,6 +316,7 @@ public:
         previewSeekDurationSamples_.fill(0);
         warmCacheProgressMessagePending_.store(false, std::memory_order_release);
         warmCacheCompletionMessagePending_.store(false, std::memory_order_release);
+        previewProxyCompletionMessagePending_.store(false, std::memory_order_release);
         exportProgressMessagePending_.store(false, std::memory_order_release);
         lastExportProgressSignalMilliseconds_.store(0, std::memory_order_release);
 
@@ -336,11 +360,18 @@ public:
         std::wstring previewError;
         if (!preview_.Open(recording_.sourcePath, previewHost_, window_, &previewError)) {
             SetStatus(L"预览不可用；仍可导出。" + previewError, EditorStatusTone::Error);
+        } else {
+            activePreviewPath_ = recording_.sourcePath;
         }
         CenterOnRecordingMonitor();
         ::ShowWindow(window_, SW_SHOW);
         ::UpdateWindow(window_);
         ::SetForegroundWindow(window_);
+        if (qualityPercent_ < media::ExportQuality::DefaultPercent) {
+            ScheduleWarmCache(kWarmCacheQualityDebounceMilliseconds);
+            SchedulePreviewProxy(kPreviewProxyDebounceMilliseconds);
+            UpdateReadyStatus();
+        }
         return true;
     }
 
@@ -557,6 +588,13 @@ private:
                         wParam,
                         lParam);
                 }
+                if (qualityControl_.WindowHandle() != nullptr) {
+                    ::SendMessageW(
+                        qualityControl_.WindowHandle(),
+                        WM_SETTINGCHANGE,
+                        wParam,
+                        lParam);
+                }
             }
             ApplyEditorDarkTitleBar(window_);
             ::InvalidateRect(window_, nullptr, FALSE);
@@ -591,6 +629,12 @@ private:
                 HandlePendingTimelineInteraction();
                 return 0;
             }
+            if (wParam == kPreviewProxyDebounceTimer) {
+                ::KillTimer(window_, kPreviewProxyDebounceTimer);
+                previewProxyDebounceArmed_ = false;
+                StartPreviewProxy();
+                return 0;
+            }
             break;
         case PreviewEventMessage:
             HandlePreviewEvent(
@@ -615,6 +659,9 @@ private:
         case kWarmCacheCompletedMessage:
             HandleWarmCacheCompleted();
             return 0;
+        case kPreviewProxyCompletedMessage:
+            HandlePreviewProxyCompleted();
+            return 0;
         case WM_KEYDOWN:
             if (wParam == VK_SPACE &&
                 (static_cast<LPARAM>(lParam) & (1LL << 30)) == 0 &&
@@ -633,6 +680,10 @@ private:
             COLORREF textColor = editor_theme::TextPrimary;
             if (control == statusText_) {
                 textColor = chrome_.StatusColor(statusTone_);
+            } else if (control == outputSizeText_) {
+                textColor = outputSizeExact_
+                    ? editor_theme::TextPrimary
+                    : editor_theme::TextSecondary;
             } else if (control == headerSubtitle_ || control == formatLabel_) {
                 textColor = editor_theme::TextSecondary;
             }
@@ -665,6 +716,7 @@ private:
                 exporter_.CancelAndWait();
             }
             StopWarmCacheAndWait();
+            StopPreviewProxyAndWait();
             ::DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
@@ -675,6 +727,7 @@ private:
             ::KillTimer(window_, kTimelineSeekTimer);
             ::KillTimer(window_, kWarmCacheDebounceTimer);
             ::KillTimer(window_, kTimelineInteractionTimer);
+            ::KillTimer(window_, kPreviewProxyDebounceTimer);
             timelineSeekTimerArmed_ = false;
             timelineInteractionTimerArmed_ = false;
             pendingTimelineSeek_.reset();
@@ -685,6 +738,7 @@ private:
             previewVideoRefreshPosted_ = false;
             mediaItemReady_ = false;
             StopWarmCacheAndWait();
+            StopPreviewProxyAndWait();
             exporter_.CancelAndWait();
             preview_.Close();
             return 0;
@@ -731,11 +785,27 @@ private:
                 instance_,
                 [this](
                     const int speedTenths,
-                    const EditorSpeedInteractionPhase phase) {
+                    const EditorSliderInteractionPhase phase) {
                     HandleSpeedChanged(speedTenths, phase);
                 })) {
             return false;
         }
+        if (!qualityControl_.Create(
+                window_,
+                kQualityControlId,
+                instance_,
+                EditorSliderPresentation::QualityPercent,
+                [this](
+                    const int qualityPercent,
+                    const EditorSliderInteractionPhase phase) {
+                    HandleQualityChanged(qualityPercent, phase);
+                })) {
+            return false;
+        }
+        outputSizeText_ = CreateStatic(
+            L"计算中",
+            kOutputSizeTextId,
+            SS_CENTER | SS_CENTERIMAGE);
         trimStartButton_ = CreateButton(kTrimStartAccessibleName, kTrimStartButtonId);
         trimEndButton_ = CreateButton(kTrimEndAccessibleName, kTrimEndButtonId);
         playButton_ = CreateButton(L"播放", kPlayButtonId);
@@ -758,7 +828,8 @@ private:
 
         const std::array controls{
             previewHost_, headerTitle_, headerSubtitle_, rangeText_, timeline_.WindowHandle(),
-            speedControl_.WindowHandle(), trimStartButton_, trimEndButton_,
+            qualityControl_.WindowHandle(), outputSizeText_, speedControl_.WindowHandle(),
+            trimStartButton_, trimEndButton_,
             playButton_, timeText_, audioToggle_.WindowHandle(), formatLabel_,
             mp4Radio_, gifRadio_, saveButton_,
             copyButton_, statusText_};
@@ -787,7 +858,9 @@ private:
         timeline_.SetRange(duration_, trimStart_, trimEnd_);
         timeline_.SetPlayhead(std::chrono::milliseconds::zero());
         speedControl_.SetValueTenths(playbackSpeedTenths_);
+        qualityControl_.SetValue(qualityPercent_);
         UpdateTimeLabels(std::chrono::milliseconds(0));
+        UpdateOutputSizeEstimate();
         UpdateHeaderSubtitle();
         RefreshAudioToggleState();
         UpdateTrimBoundaryButtonStates();
@@ -1025,6 +1098,7 @@ private:
         SetControlFont(headerTitle_, chrome_.TitleFont());
         SetControlFont(headerSubtitle_, chrome_.CaptionFont());
         SetControlFont(rangeText_, chrome_.RegularFont());
+        SetControlFont(outputSizeText_, chrome_.TimeFont());
         SetControlFont(timeline_.WindowHandle(), chrome_.CaptionFont());
         SetControlFont(trimStartButton_, chrome_.RegularFont());
         SetControlFont(trimEndButton_, chrome_.RegularFont());
@@ -1067,6 +1141,8 @@ private:
             Placement{headerSubtitle_, &layout.headerSubtitle},
             Placement{previewHost_, &layout.preview},
             Placement{rangeText_, &layout.rangeLabel},
+            Placement{qualityControl_.WindowHandle(), &layout.qualityControl},
+            Placement{outputSizeText_, &layout.outputSizeLabel},
             Placement{speedControl_.WindowHandle(), &layout.speedControl},
             Placement{trimStartButton_, &layout.trimStartButton},
             Placement{trimEndButton_, &layout.trimEndButton},
@@ -1378,7 +1454,7 @@ private:
 
     void HandleSpeedChanged(
         const int speedTenths,
-        const EditorSpeedInteractionPhase phase) {
+        const EditorSliderInteractionPhase phase) {
         if (busy_) {
             speedControl_.SetValueTenths(playbackSpeedTenths_);
             return;
@@ -1393,6 +1469,7 @@ private:
         if (valueChanged) {
             lastRangeLabelSpeedTenths_ = -1;
             UpdateTimeLabels(timeline_.Playhead());
+            UpdateOutputSizeEstimate();
             ApplyPreviewSpeed();
             if (playing_) {
                 // The playback-end guard is polled only while playing. Re-arm
@@ -1403,7 +1480,7 @@ private:
             }
         }
 
-        if (phase == EditorSpeedInteractionPhase::Preview) {
+        if (phase == EditorSliderInteractionPhase::Preview) {
             if (!speedInteractionActive_) {
                 speedInteractionActive_ = true;
                 InvalidateWarmCacheWork();
@@ -1424,6 +1501,103 @@ private:
         ScheduleWarmCache(kWarmCacheSpeedDebounceMilliseconds);
     }
 
+    static std::wstring FormatOutputSize(
+        const std::uint64_t bytes,
+        const bool exact) {
+        if (bytes == 0) {
+            return L"计算中";
+        }
+        constexpr long double kBytesPerMegabyte = 1024.0L * 1024.0L;
+        const long double megabytes = static_cast<long double>(bytes) /
+            kBytesPerMegabyte;
+        if (megabytes < 0.01L) {
+            return exact ? L"<0.01 MB" : L"~0.01 MB";
+        }
+        if (megabytes < 1.0L) {
+            return exact
+                ? std::format(L"{:.2f} MB", static_cast<double>(megabytes))
+                : std::format(L"~{:.2f} MB", static_cast<double>(megabytes));
+        }
+        return exact
+            ? std::format(L"{:.1f} MB", static_cast<double>(megabytes))
+            : std::format(L"~{:.1f} MB", static_cast<double>(megabytes));
+    }
+
+    void SetDisplayedOutputSize(
+        const std::uint64_t bytes,
+        const bool exact) {
+        const std::wstring text = FormatOutputSize(bytes, exact);
+        const bool toneChanged = outputSizeExact_ != exact;
+        outputSizeExact_ = exact;
+        if (exact) {
+            exactOutputBytes_ = bytes;
+        } else {
+            exactOutputBytes_ = 0;
+        }
+        if (displayedOutputSizeText_ == text && !toneChanged) {
+            return;
+        }
+        displayedOutputSizeText_ = text;
+        if (outputSizeText_ != nullptr) {
+            ::SetWindowTextW(outputSizeText_, text.c_str());
+            ::InvalidateRect(outputSizeText_, nullptr, FALSE);
+        }
+    }
+
+    void UpdateOutputSizeEstimate() {
+        const MediaExportEstimate estimate = MediaExporter::EstimateOutput(
+            BuildExportRequest({}));
+        estimatedOutputBytes_ = estimate.outputBytes;
+        SetDisplayedOutputSize(estimate.outputBytes, estimate.exact);
+    }
+
+    void HandleQualityChanged(
+        const int qualityPercent,
+        const EditorSliderInteractionPhase phase) {
+        if (busy_) {
+            qualityControl_.SetValue(qualityPercent_);
+            return;
+        }
+        const int normalized = media::ExportQuality::Normalize(qualityPercent);
+        const bool valueChanged = qualityPercent_ != normalized;
+        qualityPercent_ = normalized;
+        qualityControl_.SetValue(qualityPercent_);
+        if (valueChanged) {
+            UpdateOutputSizeEstimate();
+        }
+
+        if (phase == EditorSliderInteractionPhase::Preview) {
+            if (!qualityInteractionActive_) {
+                qualityInteractionActive_ = true;
+                InvalidateWarmCacheWork();
+                InvalidatePreviewProxyWork();
+            }
+            UpdateReadyStatus();
+            return;
+        }
+
+        qualityInteractionActive_ = false;
+        settings_.outputQualityPercent = qualityPercent_;
+        if (callbacks_.settingsChanged) {
+            callbacks_.settingsChanged(settings_);
+        }
+        const MediaExportEstimate estimate = MediaExporter::EstimateOutput(
+            BuildExportRequest({}));
+        WriteDiagnostic(std::format(
+            L"编辑器画质提交：quality={}%，target={}×{}，estimatedBytes={}，"
+            L"format={}，trimStart={} ms，trimEnd={} ms，speed={:.1f}x",
+            qualityPercent_,
+            estimate.outputWidth,
+            estimate.outputHeight,
+            estimate.outputBytes,
+            OutputFormatName(selectedFormat_),
+            trimStart_.count(),
+            trimEnd_.count(),
+            playbackSpeedTenths_ / 10.0));
+        ScheduleWarmCache(kWarmCacheQualityDebounceMilliseconds);
+        SchedulePreviewProxy(kPreviewProxyDebounceMilliseconds);
+    }
+
     void HandleTimelineNotification(const TimelineNotification& notification) {
         const bool committed =
             notification.phase == TimelineInteractionPhase::Committed;
@@ -1439,6 +1613,7 @@ private:
             }
             const bool wasEdited = trimRangeEdited_;
             RefreshTrimRangeEditedState();
+            UpdateOutputSizeEstimate();
             QueueTimelineSeek(notification.seekPosition, committed);
             UpdateTimelineLabels(notification.seekPosition, committed);
             if (wasEdited != trimRangeEdited_) {
@@ -1843,7 +2018,11 @@ private:
         }
         if (NeedsWarmCache() && warmCacheInProgress_) {
             SetStatus(
-                playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
+                qualityPercent_ < media::ExportQuality::DefaultPercent
+                    ? std::format(
+                        L"正在后台准备 {}% 画质成片，可继续预览",
+                        qualityPercent_)
+                : playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
                     ? L"正在后台准备倍速成片，可继续预览"
                     : (ShouldIncludeSystemAudio()
                     ? L"正在后台快速合并电脑声音，可继续编辑"
@@ -1854,6 +2033,12 @@ private:
         if (selectedFormat_ == OutputFormat::Gif) {
             SetStatus(
                 L"GIF 需要重新生成；耗时取决于片段长度",
+                EditorStatusTone::Neutral);
+        } else if (qualityPercent_ < media::ExportQuality::DefaultPercent) {
+            SetStatus(
+                std::format(
+                    L"{}% 画质成片将在后台准备；可继续预览和裁剪",
+                    qualityPercent_),
                 EditorStatusTone::Neutral);
         } else if (playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths) {
             SetStatus(
@@ -1887,6 +2072,20 @@ private:
         switch (type) {
         case MFP_EVENT_TYPE_MEDIAITEM_SET: {
             mediaItemReady_ = true;
+            if (previewReloadState_.has_value()) {
+                const PreviewReloadState reload = *previewReloadState_;
+                previewReloadState_.reset();
+                ApplyPreviewSpeed();
+                preview_.UpdateVideo();
+                timeline_.SetPlayhead(reload.position);
+                UpdateTrimBoundaryButtonStates();
+                UpdateTimeLabels(reload.position);
+                QueueTimelineSeek(reload.position, true);
+                playAfterTimelineSeek_ = reload.resumePlayback;
+                UpdatePlayButton();
+                UpdateReadyStatus();
+                break;
+            }
             const auto detectedDuration = preview_.Duration();
             if (detectedDuration.count() > 0) {
                 duration_ = detectedDuration;
@@ -2036,6 +2235,7 @@ private:
             trimStart_.count(),
             trimEnd_.count()));
         RefreshAudioToggleState();
+        UpdateOutputSizeEstimate();
         UpdateReadyStatus();
         ScheduleWarmCache();
     }
@@ -2057,6 +2257,7 @@ private:
             ShouldIncludeSystemAudio() ? L"是" : L"否"));
         ::InvalidateRect(mp4Radio_, nullptr, FALSE);
         ::InvalidateRect(gifRadio_, nullptr, FALSE);
+        UpdateOutputSizeEstimate();
         UpdateReadyStatus();
         ScheduleWarmCache();
     }
@@ -2072,6 +2273,7 @@ private:
         request.format = selectedFormat_;
         request.includeSystemAudio = ShouldIncludeSystemAudio();
         request.playbackSpeedTenths = playbackSpeedTenths_;
+        request.qualityPercent = qualityPercent_;
         request.destinationPath = destination;
         return request;
     }
@@ -2079,7 +2281,8 @@ private:
     [[nodiscard]] bool NeedsWarmCache() const noexcept {
         return selectedFormat_ == OutputFormat::Gif || trimRangeEdited_ ||
             ShouldIncludeSystemAudio() ||
-            playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths;
+            playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths ||
+            qualityPercent_ < media::ExportQuality::DefaultPercent;
     }
 
     void ClearPendingWarmCacheMessages() {
@@ -2164,6 +2367,192 @@ private:
         }
     }
 
+    [[nodiscard]] bool InitializePreviewProxyCoordinator() noexcept {
+        if (previewProxyCoordinatorStarted_) {
+            return true;
+        }
+        previewProxyCoordinatorStarted_ = previewProxyCoordinator_.Start(
+            {},
+            [this](
+                const std::uint64_t generation,
+                MediaExportResult result) {
+                {
+                    std::scoped_lock lock(previewProxyPendingMutex_);
+                    pendingPreviewProxyResult_ =
+                        WarmCacheResultState{generation, std::move(result)};
+                }
+                if (previewProxyCompletionMessagePending_.exchange(
+                        true,
+                        std::memory_order_acq_rel)) {
+                    return;
+                }
+                const HWND target = notificationTarget_.load(
+                    std::memory_order_acquire);
+                if (target == nullptr ||
+                    ::PostMessageW(
+                        target,
+                        kPreviewProxyCompletedMessage,
+                        0,
+                        0) == FALSE) {
+                    previewProxyCompletionMessagePending_.store(
+                        false,
+                        std::memory_order_release);
+                }
+            });
+        return previewProxyCoordinatorStarted_;
+    }
+
+    void InvalidatePreviewProxyWork() {
+        if (window_ != nullptr) {
+            ::KillTimer(window_, kPreviewProxyDebounceTimer);
+        }
+        previewProxyDebounceArmed_ = false;
+        ++previewProxyGeneration_;
+        previewProxyInProgress_ = false;
+        if (previewProxyCoordinatorStarted_) {
+            previewProxyCoordinator_.Cancel();
+        }
+        std::scoped_lock lock(previewProxyPendingMutex_);
+        pendingPreviewProxyResult_.reset();
+    }
+
+    void StopPreviewProxyAndWait() noexcept {
+        try {
+            InvalidatePreviewProxyWork();
+            previewProxyCoordinator_.StopAndWait();
+            previewProxyCoordinatorStarted_ = false;
+        } catch (...) {
+            // 预览代理属于可降级功能，关闭时不能阻断窗口销毁。
+        }
+    }
+
+    void SchedulePreviewProxy(const UINT debounceMilliseconds) {
+        InvalidatePreviewProxyWork();
+        if (qualityPercent_ >= media::ExportQuality::DefaultPercent) {
+            SwitchPreviewMedia(recording_.sourcePath);
+            return;
+        }
+        previewProxyDebounceArmed_ = ::SetTimer(
+            window_,
+            kPreviewProxyDebounceTimer,
+            std::max<UINT>(1, debounceMilliseconds),
+            nullptr) != 0;
+        if (!previewProxyDebounceArmed_) {
+            StartPreviewProxy();
+        }
+    }
+
+    void StartPreviewProxy() {
+        if (qualityPercent_ >= media::ExportQuality::DefaultPercent ||
+            window_ == nullptr || ::IsWindow(window_) == FALSE) {
+            return;
+        }
+        if (!InitializePreviewProxyCoordinator()) {
+            WriteDiagnostic(L"画质预览代理协调器不可用；保留当前预览。");
+            return;
+        }
+
+        ExportRequest request{};
+        request.recording = recording_;
+        request.trimStart = std::chrono::milliseconds::zero();
+        request.trimEnd = recording_.duration;
+        request.format = OutputFormat::Mp4;
+        request.includeSystemAudio = false;
+        request.playbackSpeedTenths = EditorSpeedControl::DefaultSpeedTenths;
+        request.qualityPercent = qualityPercent_;
+        request.destinationPath.clear();
+        const std::uint64_t generation = previewProxyGeneration_;
+        previewProxyInProgress_ = true;
+        if (!previewProxyCoordinator_.Submit(generation, std::move(request))) {
+            previewProxyInProgress_ = false;
+            WriteDiagnostic(L"画质预览代理请求提交失败；保留当前预览。");
+        }
+    }
+
+    void SwitchPreviewMedia(const std::filesystem::path& mediaPath) {
+        if (mediaPath.empty()) {
+            return;
+        }
+        if (!activePreviewPath_.empty() &&
+            _wcsicmp(activePreviewPath_.c_str(), mediaPath.c_str()) == 0) {
+            return;
+        }
+
+        const PreviewReloadState reload{
+            std::clamp(
+                timeline_.Playhead(),
+                std::chrono::milliseconds::zero(),
+                duration_),
+            playing_};
+        StopPlaybackUiTimer();
+        if (timelineSeekTimerArmed_) {
+            ::KillTimer(window_, kTimelineSeekTimer);
+        }
+        timelineSeekTimerArmed_ = false;
+        pendingTimelineSeek_.reset();
+        inFlightTimelineSeek_.reset();
+        previewSeekInFlight_ = false;
+        pendingTimelineSeekFinal_ = false;
+        playAfterTimelineSeek_ = false;
+        awaitingNaturalPlaybackEnd_ = false;
+        playing_ = false;
+        UpdatePlayButton();
+
+        preview_.Close();
+        mediaItemReady_ = false;
+        activePreviewPath_.clear();
+        previewReloadState_ = reload;
+        std::wstring previewError;
+        if (preview_.Open(mediaPath, previewHost_, window_, &previewError)) {
+            activePreviewPath_ = mediaPath;
+            return;
+        }
+
+        WriteDiagnostic(std::format(
+            L"画质预览切换失败：path={}，error={}",
+            mediaPath.wstring(),
+            previewError));
+        if (_wcsicmp(mediaPath.c_str(), recording_.sourcePath.c_str()) != 0 &&
+            preview_.Open(recording_.sourcePath, previewHost_, window_, &previewError)) {
+            activePreviewPath_ = recording_.sourcePath;
+            return;
+        }
+        previewReloadState_.reset();
+        SetStatus(
+            L"画质预览不可用；最终导出仍可继续。",
+            EditorStatusTone::Error);
+    }
+
+    void HandlePreviewProxyCompleted() {
+        std::optional<WarmCacheResultState> state;
+        {
+            std::scoped_lock lock(previewProxyPendingMutex_);
+            state = std::move(pendingPreviewProxyResult_);
+            pendingPreviewProxyResult_.reset();
+        }
+        previewProxyCompletionMessagePending_.store(
+            false,
+            std::memory_order_release);
+        if (!state.has_value() ||
+            state->generation != previewProxyGeneration_) {
+            return;
+        }
+        previewProxyInProgress_ = false;
+        WriteDiagnostic(std::format(
+            L"画质预览代理结果：generation={}，quality={}%，success={}，"
+            L"cacheHit={}，outputBytes={}，output={}，error={}",
+            state->generation,
+            qualityPercent_,
+            state->result.success ? L"是" : L"否",
+            state->result.cacheHit ? L"是" : L"否",
+            state->result.outputBytes,
+            state->result.outputPath.wstring(),
+            state->result.errorMessage));
+        if (state->result.success && !state->result.outputPath.empty()) {
+            SwitchPreviewMedia(state->result.outputPath);
+        }
+    }
+
     void ScheduleWarmCache(
         const std::optional<UINT> debounceMilliseconds = std::nullopt) {
         InvalidateWarmCacheWork();
@@ -2218,7 +2607,7 @@ private:
         WriteDiagnostic(std::format(
             L"后台预生成请求：generation={}，format={}，trimStart={} ms，trimEnd={} ms，"
             L"duration={} ms，trimRangeEdited={}，includeSystemAudio={}，speed={:.1f}x，"
-            L"requestStart={} ms，requestEnd={} ms",
+            L"quality={}%，requestStart={} ms，requestEnd={} ms",
             generation,
             OutputFormatName(request.format),
             trimStart_.count(),
@@ -2227,6 +2616,7 @@ private:
             trimRangeEdited_ ? L"是" : L"否",
             request.includeSystemAudio ? L"是" : L"否",
             request.playbackSpeedTenths / 10.0,
+            request.qualityPercent,
             request.trimStart.count(),
             request.trimEnd.count()));
         if (!warmCacheCoordinator_.Submit(generation, std::move(request))) {
@@ -2264,7 +2654,12 @@ private:
             const int percentage = static_cast<int>(std::lround(
                 std::clamp(state->progress.fraction, 0.0, 1.0) * 100.0));
             const std::wstring progressText =
-                playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
+                qualityPercent_ < media::ExportQuality::DefaultPercent
+                ? std::format(
+                    L"正在后台准备 {}% 画质成片，可继续预览  {}%",
+                    qualityPercent_,
+                    percentage)
+                : playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths
                 ? std::format(
                     L"正在后台准备倍速成片，可继续预览  {}%",
                     percentage)
@@ -2299,6 +2694,9 @@ private:
 
         warmCacheInProgress_ = false;
         warmCacheReady_ = state->result.success;
+        if (state->result.success && state->result.outputBytes != 0) {
+            SetDisplayedOutputSize(state->result.outputBytes, true);
+        }
         WriteDiagnostic(std::format(
             L"后台预生成结果：generation={}，success={}，cancelled={}，"
             L"disposition={}，delivery={}，elapsed={} ms，cacheHit={}，"
@@ -2358,7 +2756,8 @@ private:
         WriteDiagnostic(std::format(
             L"编辑器导出请求：action={}，format={}，trimStart={} ms，trimEnd={} ms，"
             L"duration={} ms，trimRangeEdited={}，requestStart={} ms，requestEnd={} ms，"
-            L"recordingDuration={} ms，includeSystemAudio={}，speed={:.1f}x，mode={}，source={}，"
+            L"recordingDuration={} ms，includeSystemAudio={}，speed={:.1f}x，quality={}%，"
+            L"mode={}，source={}，"
             L"audioSource={}，destination={}",
             ExportActionName(action),
             OutputFormatName(request.format),
@@ -2371,6 +2770,7 @@ private:
             request.recording.duration.count(),
             request.includeSystemAudio ? L"是" : L"否",
             request.playbackSpeedTenths / 10.0,
+            request.qualityPercent,
             passthrough ? L"原片直通" : L"重新生成媒体",
             request.recording.sourcePath.wstring(),
             request.recording.systemAudio.sourcePath.wstring(),
@@ -2395,6 +2795,12 @@ private:
                 currentExportAction_ == ExportAction::Copy
                     ? L"正在生成 GIF，完成后将复制到剪贴板…"
                     : L"正在生成 GIF，完成后将保存到本地…",
+                EditorStatusTone::Progress);
+        } else if (qualityPercent_ < media::ExportQuality::DefaultPercent) {
+            SetStatus(
+                currentExportAction_ == ExportAction::Copy
+                    ? L"正在提交画质缓存，完成后将复制到剪贴板…"
+                    : L"正在提交画质缓存，完成后将保存到本地…",
                 EditorStatusTone::Progress);
         } else if (playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths) {
             SetStatus(
@@ -2605,6 +3011,7 @@ private:
         busy_ = busy;
         timeline_.SetEnabled(!busy);
         speedControl_.SetEnabled(!busy);
+        qualityControl_.SetEnabled(!busy);
         const std::array controls{
             playButton_, mp4Radio_, gifRadio_, saveButton_, copyButton_};
         for (const HWND control : controls) {
@@ -2702,6 +3109,10 @@ private:
         }
 
         if (editorResult.success) {
+            if (mediaResult->outputBytes != 0) {
+                estimatedOutputBytes_ = mediaResult->outputBytes;
+                SetDisplayedOutputSize(mediaResult->outputBytes, true);
+            }
             std::wstring status;
             if (currentExportSystemAudio_) {
                 status = editorResult.copiedToClipboard
@@ -2796,6 +3207,7 @@ private:
     HWND playButton_{};
     HWND timeText_{};
     HWND rangeText_{};
+    HWND outputSizeText_{};
     HWND formatLabel_{};
     HWND mp4Radio_{};
     HWND gifRadio_{};
@@ -2810,6 +3222,7 @@ private:
     EditorChrome chrome_;
     TrimTimeline timeline_;
     EditorSpeedControl speedControl_;
+    EditorSpeedControl qualityControl_;
     EditorAudioToggle audioToggle_;
     MediaPreview preview_;
     MediaExporter exporter_;
@@ -2831,6 +3244,10 @@ private:
     std::chrono::milliseconds trimStart_{};
     std::chrono::milliseconds trimEnd_{1};
     int playbackSpeedTenths_{EditorSpeedControl::DefaultSpeedTenths};
+    int qualityPercent_{media::ExportQuality::DefaultPercent};
+    std::uint64_t estimatedOutputBytes_{};
+    std::uint64_t exactOutputBytes_{};
+    bool outputSizeExact_{};
     bool trimRangeEdited_{};
     bool playing_{};
     bool busy_{};
@@ -2838,6 +3255,7 @@ private:
     std::wstring displayedPlayButtonText_;
     std::wstring displayedTimeText_;
     std::wstring displayedRangeText_;
+    std::wstring displayedOutputSizeText_;
     std::wstring displayedStatusText_;
     std::optional<std::chrono::milliseconds> pendingTimelineSeek_;
     std::optional<std::chrono::milliseconds> inFlightTimelineSeek_;
@@ -2859,6 +3277,7 @@ private:
     bool awaitingNaturalPlaybackEnd_{};
     bool timelineRangeInteractionActive_{};
     bool speedInteractionActive_{};
+    bool qualityInteractionActive_{};
     bool mediaItemReady_{};
     bool previewVideoRefreshPosted_{};
     std::uint64_t timelinePreviewNotificationCount_{};
@@ -2880,6 +3299,17 @@ private:
     std::mutex warmCachePendingMutex_;
     std::optional<WarmCacheProgressState> pendingWarmCacheProgress_;
     std::optional<WarmCacheResultState> pendingWarmCacheResult_;
+
+    WarmCacheCoordinator previewProxyCoordinator_;
+    std::uint64_t previewProxyGeneration_{};
+    bool previewProxyDebounceArmed_{};
+    bool previewProxyInProgress_{};
+    bool previewProxyCoordinatorStarted_{};
+    std::atomic_bool previewProxyCompletionMessagePending_{};
+    std::mutex previewProxyPendingMutex_;
+    std::optional<WarmCacheResultState> pendingPreviewProxyResult_;
+    std::filesystem::path activePreviewPath_;
+    std::optional<PreviewReloadState> previewReloadState_;
 
     std::mutex pendingMutex_;
     std::atomic_bool exportProgressMessagePending_{};

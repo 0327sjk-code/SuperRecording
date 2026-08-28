@@ -745,7 +745,7 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const bool compact = width < Scale(window, 970);
     const int margin = Scale(window, 28);
     const int headerHeight = Scale(window, kHeaderHeight);
-    const int panelHeight = Scale(window, compact ? 278 : 224);
+    const int panelHeight = Scale(window, compact ? 316 : 224);
     const int previewGap = Scale(window, 16);
     const int previewTop = headerHeight + Scale(window, 16);
     layout.editorPanelTop = std::max(
@@ -801,6 +801,11 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const int compactButtonGap = Scale(window, 6);
     const int speedGap = Scale(window, 10);
     const int speedWidth = Scale(window, EditorSpeedControl::PreferredWidthDip);
+    const int qualityGap = Scale(window, 8);
+    const int qualityWidth = Scale(
+        window,
+        EditorSpeedControl::QualityPreferredWidthDip);
+    const int sizeWidth = Scale(window, 76);
     int rangeToolbarRight = width - margin;
     rangeToolbarRight -= compactButtonWidth;
     SetRect(
@@ -816,12 +821,30 @@ EditorChromeLayout EditorChrome::CalculateLayout(
         rangeY,
         compactButtonWidth,
         Scale(window, EditorSpeedControl::HeightDip));
-    rangeToolbarRight -= speedGap + speedWidth;
+    const int secondaryToolY = compact
+        ? rangeY + Scale(window, 38)
+        : rangeY;
+    int secondaryToolbarRight = width - margin;
+    secondaryToolbarRight -= speedWidth;
     SetRect(
         layout.speedControl,
-        rangeToolbarRight,
-        rangeY,
+        secondaryToolbarRight,
+        secondaryToolY,
         speedWidth,
+        Scale(window, EditorSpeedControl::HeightDip));
+    secondaryToolbarRight -= speedGap + sizeWidth;
+    SetRect(
+        layout.outputSizeLabel,
+        secondaryToolbarRight,
+        secondaryToolY,
+        sizeWidth,
+        Scale(window, EditorSpeedControl::HeightDip));
+    secondaryToolbarRight -= qualityGap + qualityWidth;
+    SetRect(
+        layout.qualityControl,
+        secondaryToolbarRight,
+        secondaryToolY,
+        qualityWidth,
         Scale(window, EditorSpeedControl::HeightDip));
     SetRect(
         layout.rangeLabel,
@@ -829,9 +852,12 @@ EditorChromeLayout EditorChrome::CalculateLayout(
         rangeY,
         std::max(
             1,
-            static_cast<int>(layout.speedControl.left) - margin - Scale(window, 12)),
+            (compact
+                ? static_cast<int>(layout.trimStartButton.left)
+                : static_cast<int>(layout.qualityControl.left)) -
+                margin - Scale(window, 12)),
         Scale(window, 30));
-    const int timelineY = rangeY + Scale(window, 30);
+    const int timelineY = secondaryToolY + Scale(window, 30);
     SetRect(layout.timeline, margin, timelineY, contentWidth, Scale(window, 78));
 
     const int buttonHeight = Scale(window, theme::ControlHeight);

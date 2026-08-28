@@ -13,9 +13,14 @@
 
 namespace qrec {
 
-enum class EditorSpeedInteractionPhase : std::uint8_t {
+enum class EditorSliderInteractionPhase : std::uint8_t {
     Preview,
     Committed,
+};
+
+enum class EditorSliderPresentation : std::uint8_t {
+    PlaybackSpeed,
+    QualityPercent,
 };
 
 // Compact, keyboard-accessible playback/export speed control. Values are stored
@@ -23,13 +28,15 @@ enum class EditorSpeedInteractionPhase : std::uint8_t {
 class EditorSpeedControl final {
 public:
     using ChangedCallback =
-        std::function<void(int speedTenths, EditorSpeedInteractionPhase phase)>;
+        std::function<void(int value, EditorSliderInteractionPhase phase)>;
 
     static constexpr int MinimumSpeedTenths = 1;
     static constexpr int MaximumSpeedTenths = 30;
     static constexpr int DefaultSpeedTenths = 10;
     static constexpr int PreferredWidthDip = 184;
     static constexpr int MinimumWidthDip = 164;
+    static constexpr int QualityPreferredWidthDip = 158;
+    static constexpr int QualityMinimumWidthDip = 148;
     static constexpr int HeightDip = 30;
 
     EditorSpeedControl() = default;
@@ -43,13 +50,21 @@ public:
         int controlId,
         HINSTANCE instance,
         ChangedCallback changed = {});
+    [[nodiscard]] bool Create(
+        HWND parent,
+        int controlId,
+        HINSTANCE instance,
+        EditorSliderPresentation presentation,
+        ChangedCallback changed = {});
     void Destroy() noexcept;
 
     void SetEnabled(bool enabled) noexcept;
     void SetValueTenths(int speedTenths) noexcept;
+    void SetValue(int value) noexcept;
     void SetChangedCallback(ChangedCallback changed);
 
     [[nodiscard]] int ValueTenths() const noexcept { return valueTenths_; }
+    [[nodiscard]] int Value() const noexcept { return valueTenths_; }
     [[nodiscard]] HWND WindowHandle() const noexcept { return window_; }
 
 private:
@@ -71,7 +86,11 @@ private:
     [[nodiscard]] RECT TrackBounds() const noexcept;
     [[nodiscard]] int ValueFromClientX(int x) const noexcept;
     [[nodiscard]] int ThumbCenterX() const noexcept;
-    [[nodiscard]] bool ApplyUserValue(int speedTenths);
+    [[nodiscard]] bool ApplyUserValue(int value);
+    [[nodiscard]] int MinimumValue() const noexcept;
+    [[nodiscard]] int MaximumValue() const noexcept;
+    [[nodiscard]] int ValueStep() const noexcept;
+    [[nodiscard]] int SnapValue(int value) const noexcept;
     void CommitInteraction();
     void UpdateAccessibleText() noexcept;
 
@@ -98,6 +117,7 @@ private:
     ui::MotionState pressMotion_{};
     ui::MotionState focusMotion_{};
     ChangedCallback changedCallback_;
+    EditorSliderPresentation presentation_{EditorSliderPresentation::PlaybackSpeed};
     int valueTenths_{DefaultSpeedTenths};
     UINT keyboardAdjustmentKey_{};
     bool enabled_{true};

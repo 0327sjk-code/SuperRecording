@@ -7,6 +7,7 @@
 #include "common/AppMessages.h"
 #include "common/ProductInfo.h"
 #include "common/Win32Helpers.h"
+#include "media/ExportQuality.h"
 #include "update/SelfUpdateBootstrap.h"
 
 #include <commctrl.h>
@@ -732,15 +733,27 @@ void AppController::OpenEditor(RecordingResult result) {
     editor_ = std::make_unique<EditorWindow>(instance_, window_);
     EditorWindowCallbacks callbacks;
     callbacks.settingsChanged = [this](const AppSettings& updated) {
-        // The selector workflow is owned by the tray and can change while an
-        // editor holding an older settings snapshot is open. Never let an
-        // editor callback roll that persisted choice back.
-        const bool adjustSelectionBeforeRecording =
-            settings_.adjustSelectionBeforeRecording;
-        settings_ = updated;
-        settings_.adjustSelectionBeforeRecording =
-            adjustSelectionBeforeRecording;
-        SaveSettings();
+        // The editor holds a settings snapshot. Merge only the value it owns
+        // so tray changes made while the editor is open cannot be rolled back.
+        const int requestedQuality = media::ExportQuality::Normalize(
+            updated.outputQualityPercent);
+        if (requestedQuality == settings_.outputQualityPercent) {
+            return;
+        }
+        if (!configStore_.SaveOutputQualityPercent(requestedQuality)) {
+            logger_.Error(
+                L"输出画质配置保存失败，已保持上次设置：" +
+                configStore_.FilePath().wstring());
+            trayIcon_.ShowNotification(
+                L"画质设置未保存",
+                L"无法写入 SuperRecording 配置文件，下次录屏仍使用上次画质。",
+                NIIF_WARNING);
+            return;
+        }
+        settings_.outputQualityPercent = requestedQuality;
+        logger_.Info(std::format(
+            L"输出画质已保存：{}%。",
+            requestedQuality));
     };
     callbacks.exportCompleted = [this](const EditorExportResult& exportResult) {
         if (exportResult.success) {

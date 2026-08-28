@@ -4,6 +4,7 @@
 
 #include "common/Win32Helpers.h"
 #include "media/AacAudioWriter.h"
+#include "media/ExportQuality.h"
 #include "media/Mp4BoundaryTrimmer.h"
 #include "media/Mp4Writer.h"
 
@@ -51,8 +52,6 @@ using Microsoft::WRL::ComPtr;
 
 constexpr LONGLONG kHundredNanosecondsPerMillisecond = 10'000;
 constexpr auto kPassthroughRangeTolerance = std::chrono::milliseconds(2);
-constexpr std::uint32_t kGifMaximumWidth = 1280;
-constexpr std::uint32_t kGifMaximumHeight = 720;
 constexpr int kGifMaximumFramesPerSecond = 15;
 constexpr int kNormalPlaybackSpeedTenths = 10;
 constexpr std::uint32_t kAudioWriteChunkFrames = 4'096;
@@ -208,7 +207,8 @@ std::wstring LowercaseExtension(const std::filesystem::path& path) {
 }
 
 bool IsWholeRangeMp4(const ExportRequest& request) noexcept {
-    if (request.playbackSpeedTenths != kNormalPlaybackSpeedTenths ||
+    if (request.qualityPercent != media::ExportQuality::DefaultPercent ||
+        request.playbackSpeedTenths != kNormalPlaybackSpeedTenths ||
         request.format != OutputFormat::Mp4 ||
         request.recording.sourcePath.empty() ||
         request.trimStart > kPassthroughRangeTolerance ||
@@ -240,6 +240,10 @@ bool CoversWholeSourceRange(const ExportRequest& request) noexcept {
 
 bool IsValidPlaybackSpeed(const int playbackSpeedTenths) noexcept {
     return playbackSpeedTenths >= 1 && playbackSpeedTenths <= 30;
+}
+
+bool IsValidQuality(const int qualityPercent) noexcept {
+    return media::ExportQuality::IsValid(qualityPercent);
 }
 
 std::chrono::milliseconds ScaledOutputDuration(
@@ -318,6 +322,93 @@ HRESULT ExtractTopDownBgra(
     IMFSample* sample,
     const SourceVideo& source,
     std::vector<std::uint8_t>* pixels);
+
+class BgraFrameScaler final {
+public:
+    [[nodiscard]] HRESULT Initialize() noexcept {
+        HRESULT result = ::CoCreateInstance(
+            CLSID_WICImagingFactory2,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory_));
+        if (FAILED(result)) {
+            result = ::CoCreateInstance(
+                CLSID_WICImagingFactory,
+                nullptr,
+                CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&factory_));
+        }
+        return result;
+    }
+    [[nodiscard]] HRESULT Scale(
+        const std::span<const std::uint8_t> sourcePixels,
+        const std::uint32_t sourceWidth,
+        const std::uint32_t sourceHeight,
+        const std::uint32_t outputWidth,
+        const std::uint32_t outputHeight,
+        std::vector<std::uint8_t>* outputPixels) const {
+        if (factory_ == nullptr || outputPixels == nullptr ||
+            sourceWidth == 0 || sourceHeight == 0 ||
+            outputWidth == 0 || outputHeight == 0) {
+            return E_INVALIDARG;
+        }
+        const std::uint64_t sourceStride =
+            static_cast<std::uint64_t>(sourceWidth) * 4U;
+        const std::uint64_t sourceBytes = sourceStride * sourceHeight;
+        const std::uint64_t outputStride =
+            static_cast<std::uint64_t>(outputWidth) * 4U;
+        const std::uint64_t outputBytes = outputStride * outputHeight;
+        if (sourcePixels.size() < sourceBytes ||
+            sourceStride > std::numeric_limits<UINT>::max() ||
+            sourceBytes > std::numeric_limits<UINT>::max() ||
+            outputStride > std::numeric_limits<UINT>::max() ||
+            outputBytes > std::numeric_limits<UINT>::max()) {
+            return E_OUTOFMEMORY;
+        }
+        if (sourceWidth == outputWidth && sourceHeight == outputHeight) {
+            outputPixels->assign(
+                sourcePixels.begin(),
+                sourcePixels.begin() + static_cast<std::size_t>(sourceBytes));
+            return S_OK;
+        }
+
+        ComPtr<IWICBitmap> bitmap;
+        HRESULT result = factory_->CreateBitmapFromMemory(
+            sourceWidth,
+            sourceHeight,
+            GUID_WICPixelFormat32bppBGRA,
+            static_cast<UINT>(sourceStride),
+            static_cast<UINT>(sourceBytes),
+            const_cast<BYTE*>(sourcePixels.data()),
+            &bitmap);
+        if (FAILED(result)) {
+            return result;
+        }
+
+        ComPtr<IWICBitmapScaler> scaler;
+        result = factory_->CreateBitmapScaler(&scaler);
+        if (SUCCEEDED(result)) {
+            result = scaler->Initialize(
+                bitmap.Get(),
+                outputWidth,
+                outputHeight,
+                WICBitmapInterpolationModeFant);
+        }
+        if (FAILED(result)) {
+            return result;
+        }
+
+        outputPixels->resize(static_cast<std::size_t>(outputBytes));
+        return scaler->CopyPixels(
+            nullptr,
+            static_cast<UINT>(outputStride),
+            static_cast<UINT>(outputBytes),
+            outputPixels->data());
+    }
+
+private:
+    ComPtr<IWICImagingFactory> factory_;
+};
 
 HRESULT MaterializePassthroughMp4(
     const std::filesystem::path& source,
@@ -1251,15 +1342,6 @@ LONGLONG NominalFrameDuration(const SourceVideo& source) noexcept {
             static_cast<LONGLONG>(source.frameRateNumerator));
 }
 
-std::uint32_t ComputeVideoBitRate(const SourceVideo& source) noexcept {
-    const double framesPerSecond = static_cast<double>(source.frameRateNumerator) /
-        static_cast<double>(source.frameRateDenominator);
-    const double estimated = static_cast<double>(source.width) *
-        static_cast<double>(source.height) * framesPerSecond * 0.16;
-    return static_cast<std::uint32_t>(
-        std::clamp(estimated, 4'000'000.0, 60'000'000.0));
-}
-
 HRESULT ExportMp4(
     const ExportRequest& request,
     const std::filesystem::path& partialPath,
@@ -1301,13 +1383,40 @@ HRESULT ExportMp4(
             request.recording.framesPerSecond == 60
         ? request.recording.framesPerSecond
         : (sourceFramesPerSecond >= 45.0 ? 60 : 30);
+    const media::ExportPixelSize outputSize =
+        media::ExportQuality::ComputeMp4Size(
+            source.width,
+            source.height,
+            request.qualityPercent);
+    if (outputSize.width == 0 || outputSize.height == 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"无法计算有效的 MP4 输出尺寸。";
+        }
+        return E_INVALIDARG;
+    }
+    BgraFrameScaler frameScaler;
+    const bool scalingRequired = outputSize.width != source.width ||
+        outputSize.height != source.height;
+    if (scalingRequired) {
+        result = frameScaler.Initialize();
+        if (FAILED(result)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = HResultMessage(L"无法启动高质量画面缩放器", result);
+            }
+            return result;
+        }
+    }
     media::Mp4Writer writer;
     media::Mp4WriterConfig writerConfig{};
     writerConfig.outputPath = partialPath;
-    writerConfig.width = source.width;
-    writerConfig.height = source.height;
+    writerConfig.width = outputSize.width;
+    writerConfig.height = outputSize.height;
     writerConfig.framesPerSecond = framesPerSecond;
-    writerConfig.averageBitrate = ComputeVideoBitRate(source);
+    writerConfig.averageBitrate = media::ExportQuality::ComputeVideoBitrate(
+        outputSize.width,
+        outputSize.height,
+        framesPerSecond,
+        request.qualityPercent);
     writerConfig.preferHardwareEncoder = true;
     std::wstring writerError;
     long writerNativeError = 0;
@@ -1332,6 +1441,7 @@ HRESULT ExportMp4(
     std::optional<LONGLONG> outputBase;
     std::uint64_t writtenFrames = 0;
     std::vector<std::uint8_t> pixels;
+    std::vector<std::uint8_t> scaledPixels;
     LONGLONG lastOutputTimestamp = -1;
 
     for (;;) {
@@ -1379,9 +1489,26 @@ HRESULT ExportMp4(
             }
             return result;
         }
-        if (!writer.WriteBgraFrame(
+        const std::vector<std::uint8_t>* writerPixels = &pixels;
+        if (scalingRequired) {
+            result = frameScaler.Scale(
                 pixels,
-                source.width * 4U,
+                source.width,
+                source.height,
+                outputSize.width,
+                outputSize.height,
+                &scaledPixels);
+            if (FAILED(result)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = HResultMessage(L"缩放导出视频帧失败", result);
+                }
+                return result;
+            }
+            writerPixels = &scaledPixels;
+        }
+        if (!writer.WriteBgraFrame(
+                *writerPixels,
+                outputSize.width * 4U,
                 outputTimestamp,
                 outputDuration,
                 writerError,
@@ -1419,14 +1546,13 @@ HRESULT ExportMp4(
 
 std::pair<std::uint32_t, std::uint32_t> ComputeGifSize(
     const std::uint32_t width,
-    const std::uint32_t height) noexcept {
-    const double scale = std::min({
-        1.0,
-        static_cast<double>(kGifMaximumWidth) / static_cast<double>(width),
-        static_cast<double>(kGifMaximumHeight) / static_cast<double>(height)});
-    return {
-        std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::lround(width * scale))),
-        std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::lround(height * scale)))};
+    const std::uint32_t height,
+    const int qualityPercent) noexcept {
+    const media::ExportPixelSize size = media::ExportQuality::ComputeGifSize(
+        width,
+        height,
+        qualityPercent);
+    return {size.width, size.height};
 }
 
 HRESULT ExtractTopDownBgra(
@@ -1740,7 +1866,10 @@ HRESULT ExportGif(
     const int gifFramesPerSecond = std::clamp(
         static_cast<int>(std::lround(sourceFramesPerSecond)), 1, kGifMaximumFramesPerSecond);
     const LONGLONG gifFrameStep = 10'000'000LL / gifFramesPerSecond;
-    const auto [outputWidth, outputHeight] = ComputeGifSize(source.width, source.height);
+    const auto [outputWidth, outputHeight] = ComputeGifSize(
+        source.width,
+        source.height,
+        request.qualityPercent);
     const LONGLONG requestedDuration = std::max<LONGLONG>(1, trimEnd - trimStart);
     LONGLONG nextFrameTime = trimStart;
     std::uint64_t writtenFrames = 0;
@@ -1857,6 +1986,11 @@ MediaExportResult PrepareCachedArtifact(
     if (!IsValidPlaybackSpeed(request.playbackSpeedTenths)) {
         result.nativeError = E_INVALIDARG;
         result.errorMessage = L"导出倍速必须在 0.1× 到 3.0× 之间。";
+        return result;
+    }
+    if (!IsValidQuality(request.qualityPercent)) {
+        result.nativeError = E_INVALIDARG;
+        result.errorMessage = L"导出画质必须在 25% 到 100% 之间。";
         return result;
     }
     if (stopToken.stop_requested()) {
@@ -2069,6 +2203,28 @@ MediaExportResult PrepareCachedArtifact(
                     generatedDisposition = MediaExportDisposition::Transcoded;
                     generationDiagnostic = L"generator=GifTranscode";
                     return ExportGif(
+                        request,
+                        stagingPath,
+                        progress,
+                        generationStopToken,
+                        generationError);
+                }
+
+                if (request.qualityPercent <
+                    media::ExportQuality::DefaultPercent) {
+                    const media::ExportPixelSize outputSize =
+                        media::ExportQuality::ComputeMp4Size(
+                            request.recording.width,
+                            request.recording.height,
+                            request.qualityPercent);
+                    generatedDisposition = MediaExportDisposition::Transcoded;
+                    generationDiagnostic = std::format(
+                        L"generator=QualityTranscode; qualityPercent={}; "
+                        L"targetWidth={}; targetHeight={}",
+                        request.qualityPercent,
+                        outputSize.width,
+                        outputSize.height);
+                    return ExportMp4(
                         request,
                         stagingPath,
                         progress,
@@ -2306,7 +2462,7 @@ void CompleteDiagnostics(
     const std::wstring error = result->errorMessage;
     result->diagnosticSummary = std::format(
         L"format={}; source={}; trimStartMs={}; trimEndMs={}; "
-        L"recordingDurationMs={}; playbackSpeedTenths={}; "
+        L"recordingDurationMs={}; playbackSpeedTenths={}; qualityPercent={}; "
         L"includeSystemAudio={}; audioSource={}; "
         L"sourceBytes={}; cacheKey={}; cacheHit={}; "
         L"waitedForCacheBuilder={}; cacheBuilderWaitMs={}; "
@@ -2319,6 +2475,7 @@ void CompleteDiagnostics(
         request.trimEnd.count(),
         request.recording.duration.count(),
         request.playbackSpeedTenths,
+        request.qualityPercent,
         request.includeSystemAudio ? L"true" : L"false",
         request.recording.systemAudio.sourcePath.wstring(),
         result->sourceBytes,
@@ -2538,6 +2695,114 @@ bool MediaExporter::CanUsePassthrough(const ExportRequest& request) noexcept {
     return true;
 }
 
+MediaExportEstimate MediaExporter::EstimateOutput(
+    const ExportRequest& request) noexcept {
+    MediaExportEstimate estimate{};
+    if (!IsValidPlaybackSpeed(request.playbackSpeedTenths) ||
+        !IsValidQuality(request.qualityPercent)) {
+        return estimate;
+    }
+
+    const std::uint32_t sourceWidth = request.recording.width != 0
+        ? request.recording.width
+        : static_cast<std::uint32_t>(std::max(0, request.recording.region.Width()));
+    const std::uint32_t sourceHeight = request.recording.height != 0
+        ? request.recording.height
+        : static_cast<std::uint32_t>(std::max(0, request.recording.region.Height()));
+    const media::ExportPixelSize outputSize = request.format == OutputFormat::Gif
+        ? media::ExportQuality::ComputeGifSize(
+            sourceWidth,
+            sourceHeight,
+            request.qualityPercent)
+        : media::ExportQuality::ComputeMp4Size(
+            sourceWidth,
+            sourceHeight,
+            request.qualityPercent);
+    estimate.outputWidth = outputSize.width;
+    estimate.outputHeight = outputSize.height;
+    if (outputSize.width == 0 || outputSize.height == 0) {
+        return estimate;
+    }
+
+    const std::uint64_t sourceBytes = FileSizeOrZero(request.recording.sourcePath);
+    if (!request.includeSystemAudio && IsWholeRangeMp4(request) && sourceBytes != 0) {
+        estimate.outputBytes = sourceBytes;
+        estimate.exact = true;
+        return estimate;
+    }
+
+    const auto sourceSpan = request.trimEnd > request.trimStart
+        ? request.trimEnd - request.trimStart
+        : request.recording.duration;
+    if (sourceSpan.count() <= 0) {
+        return estimate;
+    }
+
+    constexpr long double kBitsPerByte = 8.0L;
+    constexpr long double kMillisecondsPerSecond = 1'000.0L;
+    constexpr long double kMp4ContainerFactor = 1.015L;
+    constexpr long double kCompressedPathFactor = 1.02L;
+    constexpr long double kStereoAacBitrate = 192'000.0L;
+    constexpr long double kGifBytesPerPixelFrame = 0.22L;
+    constexpr long double kGifFixedOverheadBytes = 4'096.0L;
+    constexpr long double kMp4FixedOverheadBytes = 16'384.0L;
+
+    long double predictedBytes = 0.0L;
+    if (request.format == OutputFormat::Gif) {
+        const int sourceFramesPerSecond = std::max(
+            1,
+            request.recording.framesPerSecond);
+        const int gifFramesPerSecond = std::min(
+            sourceFramesPerSecond,
+            kGifMaximumFramesPerSecond);
+        const long double frameCount = std::max(
+            1.0L,
+            std::ceil(
+                static_cast<long double>(sourceSpan.count()) *
+                gifFramesPerSecond / kMillisecondsPerSecond));
+        predictedBytes = static_cast<long double>(outputSize.width) *
+            outputSize.height * frameCount * kGifBytesPerPixelFrame +
+            kGifFixedOverheadBytes;
+    } else if (request.qualityPercent ==
+               media::ExportQuality::DefaultPercent &&
+               sourceBytes != 0 && request.recording.duration.count() > 0) {
+        const long double retainedRatio = std::clamp(
+            static_cast<long double>(sourceSpan.count()) /
+                static_cast<long double>(request.recording.duration.count()),
+            0.0L,
+            1.0L);
+        predictedBytes = static_cast<long double>(sourceBytes) *
+            retainedRatio * kCompressedPathFactor;
+    } else {
+        const int framesPerSecond =
+            request.recording.framesPerSecond == 30 ||
+                request.recording.framesPerSecond == 60
+            ? request.recording.framesPerSecond
+            : 60;
+        const std::uint32_t bitrate = media::ExportQuality::ComputeVideoBitrate(
+            outputSize.width,
+            outputSize.height,
+            framesPerSecond,
+            request.qualityPercent);
+        const auto outputDuration = ScaledOutputDuration(request);
+        predictedBytes = static_cast<long double>(bitrate) *
+            outputDuration.count() /
+            (kBitsPerByte * kMillisecondsPerSecond) * kMp4ContainerFactor +
+            kMp4FixedOverheadBytes;
+    }
+
+    if (request.includeSystemAudio) {
+        const auto outputDuration = ScaledOutputDuration(request);
+        predictedBytes += kStereoAacBitrate * outputDuration.count() /
+            (kBitsPerByte * kMillisecondsPerSecond);
+    }
+    estimate.outputBytes = static_cast<std::uint64_t>(std::clamp(
+        std::ceil(predictedBytes),
+        0.0L,
+        static_cast<long double>(std::numeric_limits<std::uint64_t>::max())));
+    return estimate;
+}
+
 bool MediaExporter::CopyFileToClipboard(
     const HWND owner,
     const std::filesystem::path& filePath,
@@ -2618,6 +2883,11 @@ MediaExportResult MediaExporter::RunExport(
     if (!IsValidPlaybackSpeed(request.playbackSpeedTenths)) {
         result.nativeError = E_INVALIDARG;
         result.errorMessage = L"导出倍速必须在 0.1× 到 3.0× 之间。";
+        return result;
+    }
+    if (!IsValidQuality(request.qualityPercent)) {
+        result.nativeError = E_INVALIDARG;
+        result.errorMessage = L"导出画质必须在 25% 到 100% 之间。";
         return result;
     }
     std::error_code fileError;

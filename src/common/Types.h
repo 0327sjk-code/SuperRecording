@@ -42,6 +42,7 @@ struct AppSettings final {
     bool includeCursor{true};
     bool keepEditorOpenAfterExport{true};
     bool adjustSelectionBeforeRecording{false};
+    int outputQualityPercent{100};
 };
 
 struct RecordingStats final {
@@ -76,6 +77,7 @@ struct ExportRequest final {
     OutputFormat format{OutputFormat::Mp4};
     bool includeSystemAudio{};
     int playbackSpeedTenths{10};
+    int qualityPercent{100};
     std::filesystem::path destinationPath;
 };
 

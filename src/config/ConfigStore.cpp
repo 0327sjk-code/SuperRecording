@@ -1,10 +1,14 @@
 #include "config/ConfigStore.h"
 
 #include "common/Win32Helpers.h"
+#include "media/ExportQuality.h"
 
 #include <windows.h>
 
 #include <array>
+#include <cerrno>
+#include <cwchar>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -20,6 +24,32 @@ bool WriteValue(
     const wchar_t* key,
     const std::wstring& value) {
     return ::WritePrivateProfileStringW(kSection, key, value.c_str(), path.c_str()) != FALSE;
+}
+
+int ReadOutputQualityPercent(const std::filesystem::path& path) {
+    std::array<wchar_t, 32> valueBuffer{};
+    ::GetPrivateProfileStringW(
+        kSection,
+        L"OutputQualityPercent",
+        L"100",
+        valueBuffer.data(),
+        static_cast<DWORD>(valueBuffer.size()),
+        path.c_str());
+
+    wchar_t* parseEnd = nullptr;
+    errno = 0;
+    const long parsed = std::wcstol(valueBuffer.data(), &parseEnd, 10);
+    if (errno == ERANGE || parseEnd == valueBuffer.data() ||
+        parseEnd == nullptr || *parseEnd != L'\0' ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        return media::ExportQuality::DefaultPercent;
+    }
+    const int stored = static_cast<int>(parsed);
+    if (!media::ExportQuality::IsValid(stored)) {
+        return media::ExportQuality::DefaultPercent;
+    }
+    return media::ExportQuality::Normalize(stored);
 }
 
 }  // namespace
@@ -85,6 +115,7 @@ AppSettings ConfigStore::Load() const {
     // malformed setting. Only an explicitly persisted "1" enables it.
     settings.adjustSelectionBeforeRecording =
         std::wstring_view(adjustSelectionBuffer.data()) == L"1";
+    settings.outputQualityPercent = ReadOutputQualityPercent(filePath_);
 
     std::wstring ignoredError;
     static_cast<void>(win32::EnsureDirectory(settings.saveDirectory, &ignoredError));
@@ -116,8 +147,16 @@ bool ConfigStore::Save(const AppSettings& settings) const {
         filePath_,
         L"AdjustSelectionBeforeRecording",
         settings.adjustSelectionBeforeRecording ? L"1" : L"0");
+    const int normalizedQuality = media::ExportQuality::IsValid(
+        settings.outputQualityPercent)
+        ? media::ExportQuality::Normalize(settings.outputQualityPercent)
+        : media::ExportQuality::DefaultPercent;
+    const bool outputQualityWritten = WriteValue(
+        filePath_,
+        L"OutputQualityPercent",
+        std::to_wstring(normalizedQuality));
     return fpsWritten && directoryWritten && formatWritten && cursorWritten &&
-        keepEditorOpenWritten && adjustSelectionWritten;
+        keepEditorOpenWritten && adjustSelectionWritten && outputQualityWritten;
 }
 
 bool ConfigStore::LoadStartupEnabled() const {
@@ -220,6 +259,28 @@ bool ConfigStore::SaveAdjustSelectionBeforeRecording(const bool enabled) const {
         static_cast<DWORD>(valueBuffer.size()),
         filePath_.c_str());
     return std::wstring_view(valueBuffer.data()) == (enabled ? L"1" : L"0");
+}
+
+bool ConfigStore::SaveOutputQualityPercent(const int qualityPercent) const {
+    if (!media::ExportQuality::IsValid(qualityPercent)) {
+        return false;
+    }
+
+    const int normalized = media::ExportQuality::Normalize(qualityPercent);
+    std::wstring ignoredError;
+    if (!win32::EnsureDirectory(filePath_.parent_path(), &ignoredError) ||
+        !WriteValue(
+            filePath_,
+            L"OutputQualityPercent",
+            std::to_wstring(normalized))) {
+        return false;
+    }
+
+    // Commit the profile cache before returning so the next recorder/editor
+    // session observes the new quality immediately.
+    static_cast<void>(
+        ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, filePath_.c_str()));
+    return ReadOutputQualityPercent(filePath_) == normalized;
 }
 
 bool ConfigStore::MigrateLegacySettingsIfNeeded() const noexcept {

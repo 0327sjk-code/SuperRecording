@@ -40,6 +40,8 @@ struct EditorChromeLayout final {
     RECT previewStage{};
     RECT preview{};
     RECT rangeLabel{};
+    RECT qualityControl{};
+    RECT outputSizeLabel{};
     RECT speedControl{};
     RECT trimStartButton{};
     RECT trimEndButton{};

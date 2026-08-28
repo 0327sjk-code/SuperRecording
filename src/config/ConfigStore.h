@@ -20,6 +20,7 @@ public:
     [[nodiscard]] bool SaveRecordingHotkey(const HotkeyBinding& binding) const;
     [[nodiscard]] bool SaveKeepEditorOpenAfterExport(bool enabled) const;
     [[nodiscard]] bool SaveAdjustSelectionBeforeRecording(bool enabled) const;
+    [[nodiscard]] bool SaveOutputQualityPercent(int qualityPercent) const;
     [[nodiscard]] const std::filesystem::path& FilePath() const noexcept { return filePath_; }
     [[nodiscard]] bool LegacySettingsMigrated() const noexcept {
         return legacySettingsMigrated_;

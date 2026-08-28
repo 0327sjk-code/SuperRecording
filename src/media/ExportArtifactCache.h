@@ -41,6 +41,7 @@ struct ExportArtifactCacheKey final {
     std::int64_t trimEndMilliseconds{};
     OutputFormat format{OutputFormat::Mp4};
     int playbackSpeedTenths{10};
+    int qualityPercent{100};
 
     [[nodiscard]] bool operator==(
         const ExportArtifactCacheKey& other) const noexcept {
@@ -60,7 +61,8 @@ struct ExportArtifactCacheKey final {
             trimStartMilliseconds == other.trimStartMilliseconds &&
             trimEndMilliseconds == other.trimEndMilliseconds &&
             format == other.format &&
-            playbackSpeedTenths == other.playbackSpeedTenths;
+            playbackSpeedTenths == other.playbackSpeedTenths &&
+            qualityPercent == other.qualityPercent;
     }
 };
 

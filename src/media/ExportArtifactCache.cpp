@@ -2,6 +2,7 @@
 
 #include "common/ProductInfo.h"
 #include "common/Win32Helpers.h"
+#include "media/ExportQuality.h"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +26,8 @@ using namespace std::chrono_literals;
 
 constexpr std::wstring_view kArtifactPrefix = L"qrec-artifact-";
 constexpr std::wstring_view kStagingPrefix = L"qrec-cache-staging-";
-constexpr std::wstring_view kCacheVersion = L"qrec-export-cache-v9-playback-speed";
+constexpr std::wstring_view kCacheVersion =
+    L"qrec-export-cache-v10-quality-percent";
 constexpr auto kArtifactRetention = std::chrono::hours(24 * 7);
 constexpr auto kStagingRetention = std::chrono::hours(24);
 
@@ -220,7 +222,7 @@ private:
 
 [[nodiscard]] std::wstring SerializeKey(const ExportArtifactCacheKey& key) {
     return std::format(
-        L"{}|{}:{}|{}|{}|{}|{}|{}|{}|{}:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        L"{}|{}:{}|{}|{}|{}|{}|{}|{}|{}:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         kCacheVersion,
         key.normalizedSourcePath.size(),
         key.normalizedSourcePath,
@@ -240,7 +242,8 @@ private:
         key.trimStartMilliseconds,
         key.trimEndMilliseconds,
         static_cast<unsigned int>(key.format),
-        key.playbackSpeedTenths);
+        key.playbackSpeedTenths,
+        key.qualityPercent);
 }
 
 [[nodiscard]] std::wstring SerializeManifest(
@@ -307,9 +310,12 @@ private:
         hash,
         static_cast<std::uint64_t>(key.trimEndMilliseconds));
     hash = HashUnsignedValue(hash, static_cast<std::uint64_t>(key.format));
-    return HashUnsignedValue(
+    hash = HashUnsignedValue(
         hash,
         static_cast<std::uint64_t>(key.playbackSpeedTenths));
+    return HashUnsignedValue(
+        hash,
+        static_cast<std::uint64_t>(key.qualityPercent));
 }
 
 [[nodiscard]] std::wstring NormalizeExtension(const std::wstring_view extension) {
@@ -770,6 +776,12 @@ std::optional<ExportArtifactCacheKey> ExportArtifactCache::BuildKey(
         }
         return std::nullopt;
     }
+    if (!media::ExportQuality::IsValid(request.qualityPercent)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = L"导出画质必须在 25% 到 100% 之间。";
+        }
+        return std::nullopt;
+    }
     std::optional<ExportArtifactCacheKey> key = BuildKey(
         request.recording.sourcePath,
         request.trimStart,
@@ -778,6 +790,7 @@ std::optional<ExportArtifactCacheKey> ExportArtifactCache::BuildKey(
         errorMessage);
     if (key.has_value()) {
         key->playbackSpeedTenths = request.playbackSpeedTenths;
+        key->qualityPercent = request.qualityPercent;
     }
     if (!key.has_value() || !request.includeSystemAudio) {
         return key;

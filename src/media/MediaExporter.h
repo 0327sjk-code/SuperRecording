@@ -53,6 +53,13 @@ struct MediaExportResult final {
     HRESULT nativeError{E_FAIL};
 };
 
+struct MediaExportEstimate final {
+    std::uint64_t outputBytes{};
+    std::uint32_t outputWidth{};
+    std::uint32_t outputHeight{};
+    bool exact{};
+};
+
 class MediaExporter final {
 public:
     using ProgressCallback = std::function<void(const ExportProgress&)>;
@@ -91,6 +98,11 @@ public:
     // O(1) hard link when source and destination share a volume and otherwise
     // falls back to an asynchronous file copy.
     [[nodiscard]] static bool CanUsePassthrough(
+        const ExportRequest& request) noexcept;
+
+    // Fast, non-encoding estimate for responsive editor feedback. Exact is
+    // true only when the final artifact is guaranteed to be the source file.
+    [[nodiscard]] static MediaExportEstimate EstimateOutput(
         const ExportRequest& request) noexcept;
 
     // 使用 CF_HDROP 复制实际导出文件，资源管理器和聊天软件可直接粘贴。
