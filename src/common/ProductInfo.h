@@ -4,7 +4,7 @@ namespace qrec::product {
 
 inline constexpr wchar_t Name[] = L"SuperRecording";
 inline constexpr wchar_t LegacyName[] = L"QingRecorder";
-inline constexpr wchar_t Version[] = L"1.5.3";
+inline constexpr wchar_t Version[] = L"1.6.0";
 inline constexpr wchar_t GitHubRepository[] = L"0327sjk-code/SuperRecording";
 inline constexpr wchar_t UpdateVersionUrl[] =
     L"https://github.com/0327sjk-code/SuperRecording/releases/latest/download/version.txt";
