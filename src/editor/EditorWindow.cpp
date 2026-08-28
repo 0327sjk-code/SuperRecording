@@ -8,9 +8,11 @@
 #include "editor/EditorTheme.h"
 #include "editor/EditorTimeFormat.h"
 #include "editor/MediaPreview.h"
+#include "editor/PreparedExportArtifact.h"
 #include "editor/TrimTimeline.h"
 #include "editor/WarmCacheCoordinator.h"
 #include "media/ExportQuality.h"
+#include "media/InstantArtifactDelivery.h"
 #include "media/Mp4BoundaryEncoderPool.h"
 #include "media/MediaExporter.h"
 #include "ui/Motion.h"
@@ -49,6 +51,7 @@ constexpr UINT kTimelineInteractionFrameMilliseconds = 16;
 constexpr auto kPlaybackTextRefreshInterval = std::chrono::milliseconds(33);
 constexpr auto kTimelineSeekPreviewInterval = std::chrono::milliseconds(16);
 constexpr auto kProgressUiInterval = std::chrono::milliseconds(100);
+constexpr auto kProgressVisibilityDelay = std::chrono::milliseconds(150);
 constexpr UINT kWarmCacheMp4DebounceMilliseconds = 16;
 constexpr UINT kWarmCacheGifDebounceMilliseconds = 350;
 constexpr UINT kWarmCacheSpeedDebounceMilliseconds = 250;
@@ -130,6 +133,12 @@ struct WarmCacheProgressState final {
 struct WarmCacheResultState final {
     std::uint64_t generation{};
     MediaExportResult result;
+};
+
+struct PendingWarmExportState final {
+    std::uint64_t generation{};
+    ExportRequest request;
+    ExportAction action{ExportAction::Save};
 };
 
 struct PreviewReloadState final {
@@ -251,9 +260,6 @@ public:
         }
 
         recording_ = std::move(recording);
-        boundaryEncoderGeneration_ =
-            detail::Mp4BoundaryEncoderPool::Shared().Prepare(
-                recording_.sourcePath);
         settings_ = std::move(settings);
         callbacks_ = std::move(callbacks);
         // 输出格式只属于当前编辑会话；每次打开编辑器都从 MP4 开始。
@@ -270,6 +276,7 @@ public:
         qualityPercent_ = media::ExportQuality::Normalize(
             settings_.outputQualityPercent);
         settings_.outputQualityPercent = qualityPercent_;
+        RefreshBoundaryEncoderPreparation();
         estimatedOutputBytes_ = 0;
         exactOutputBytes_ = 0;
         outputSizeExact_ = false;
@@ -357,19 +364,24 @@ public:
             WriteDiagnostic(L"后台预生成协调器启动失败；导出仍可按需执行。");
         }
 
+        const std::filesystem::path initialPreviewPath =
+            CurrentQualityVideoPath();
         std::wstring previewError;
-        if (!preview_.Open(recording_.sourcePath, previewHost_, window_, &previewError)) {
+        if (!preview_.Open(initialPreviewPath, previewHost_, window_, &previewError)) {
             SetStatus(L"预览不可用；仍可导出。" + previewError, EditorStatusTone::Error);
         } else {
-            activePreviewPath_ = recording_.sourcePath;
+            activePreviewPath_ = initialPreviewPath;
         }
         CenterOnRecordingMonitor();
         ::ShowWindow(window_, SW_SHOW);
         ::UpdateWindow(window_);
         ::SetForegroundWindow(window_);
-        if (qualityPercent_ < media::ExportQuality::DefaultPercent) {
+        if (qualityPercent_ < media::ExportQuality::DefaultPercent &&
+            !HasPreparedCaptureVideoForCurrentQuality()) {
             ScheduleWarmCache(kWarmCacheQualityDebounceMilliseconds);
             SchedulePreviewProxy(kPreviewProxyDebounceMilliseconds);
+            UpdateReadyStatus();
+        } else {
             UpdateReadyStatus();
         }
         return true;
@@ -397,14 +409,51 @@ public:
     }
 
 private:
+    [[nodiscard]] bool HasPreparedCaptureVideoForCurrentQuality() const noexcept {
+        const PreparedVideoRecording& prepared = recording_.preparedVideo;
+        if (!prepared.available || prepared.sourcePath.empty() ||
+            prepared.qualityPercent != qualityPercent_ ||
+            prepared.width < 16 || prepared.height < 16 ||
+            prepared.width % 2U != 0 || prepared.height % 2U != 0) {
+            return false;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+        if (::GetFileAttributesExW(
+                prepared.sourcePath.c_str(),
+                GetFileExInfoStandard,
+                &attributes) == FALSE ||
+            (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            return false;
+        }
+        ULARGE_INTEGER size{};
+        size.HighPart = attributes.nFileSizeHigh;
+        size.LowPart = attributes.nFileSizeLow;
+        return size.QuadPart != 0;
+    }
+
+    [[nodiscard]] std::filesystem::path CurrentQualityVideoPath() const {
+        return HasPreparedCaptureVideoForCurrentQuality()
+            ? recording_.preparedVideo.sourcePath
+            : recording_.sourcePath;
+    }
+
+    void RefreshBoundaryEncoderPreparation() {
+        DiscardBoundaryEncoderPreparation();
+        boundaryEncoderSourcePath_ = CurrentQualityVideoPath();
+        boundaryEncoderGeneration_ =
+            detail::Mp4BoundaryEncoderPool::Shared().Prepare(
+                boundaryEncoderSourcePath_);
+    }
+
     void DiscardBoundaryEncoderPreparation() noexcept {
         if (boundaryEncoderGeneration_ == 0) {
             return;
         }
         detail::Mp4BoundaryEncoderPool::Shared().Discard(
-            recording_.sourcePath,
+            boundaryEncoderSourcePath_,
             boundaryEncoderGeneration_);
         boundaryEncoderGeneration_ = 0;
+        boundaryEncoderSourcePath_.clear();
     }
 
     void CenterOnRecordingMonitor() const noexcept {
@@ -1578,6 +1627,7 @@ private:
 
         qualityInteractionActive_ = false;
         settings_.outputQualityPercent = qualityPercent_;
+        RefreshBoundaryEncoderPreparation();
         if (callbacks_.settingsChanged) {
             callbacks_.settingsChanged(settings_);
         }
@@ -2030,6 +2080,17 @@ private:
                 EditorStatusTone::Progress);
             return;
         }
+        if (selectedFormat_ == OutputFormat::Mp4 && !trimRangeEdited_ &&
+            !ShouldIncludeSystemAudio() &&
+            playbackSpeedTenths_ == EditorSpeedControl::DefaultSpeedTenths &&
+            HasPreparedCaptureVideoForCurrentQuality()) {
+            SetStatus(
+                std::format(
+                    L"{}% 画质成片已随录制完成；复制或保存将立即完成",
+                    qualityPercent_),
+                EditorStatusTone::Success);
+            return;
+        }
         if (selectedFormat_ == OutputFormat::Gif) {
             SetStatus(
                 L"GIF 需要重新生成；耗时取决于片段长度",
@@ -2088,26 +2149,45 @@ private:
             }
             const auto detectedDuration = preview_.Duration();
             if (detectedDuration.count() > 0) {
-                duration_ = detectedDuration;
-                trimStart_ = std::chrono::milliseconds(0);
-                trimEnd_ = duration_;
-                trimRangeEdited_ = false;
-                timeline_.SetRange(duration_, trimStart_, trimEnd_);
-                timeline_.SetPlayhead(std::chrono::milliseconds::zero());
-                UpdateTrimBoundaryButtonStates();
-                UpdateTimeLabels(std::chrono::milliseconds(0));
-                UpdateHeaderSubtitle();
-                WriteDiagnostic(std::format(
-                    L"编辑器媒体时长已探测：trimStart=0 ms，trimEnd={} ms，duration={} ms，"
-                    L"recordingDuration={} ms，trimRangeEdited=否，format={}",
-                    trimEnd_.count(),
-                    duration_.count(),
-                    recording_.duration.count(),
-                    OutputFormatName(selectedFormat_)));
-                ScheduleWarmCache();
+                const bool pristineRange =
+                    !trimRangeEdited_ && !timelineRangeInteractionActive_ &&
+                    trimStart_ == std::chrono::milliseconds::zero() &&
+                    trimEnd_ == duration_;
+                if (pristineRange) {
+                    duration_ = detectedDuration;
+                    trimStart_ = std::chrono::milliseconds::zero();
+                    trimEnd_ = duration_;
+                    timeline_.SetRange(duration_, trimStart_, trimEnd_);
+                    timeline_.SetPlayhead(std::chrono::milliseconds::zero());
+                    UpdateTrimBoundaryButtonStates();
+                    UpdateTimeLabels(std::chrono::milliseconds::zero());
+                    UpdateHeaderSubtitle();
+                    WriteDiagnostic(std::format(
+                        L"编辑器媒体时长已探测：trimStart=0 ms，trimEnd={} ms，"
+                        L"duration={} ms，recordingDuration={} ms，"
+                        L"trimRangeEdited=否，format={}，保留当前后台成片任务",
+                        trimEnd_.count(),
+                        duration_.count(),
+                        recording_.duration.count(),
+                        OutputFormatName(selectedFormat_)));
+                } else {
+                    WriteDiagnostic(std::format(
+                        L"编辑器媒体时长已探测：duration={} ms；用户已调整裁切范围，"
+                        L"保留 trimStart={} ms、trimEnd={} ms 和当前后台成片任务",
+                        detectedDuration.count(),
+                        trimStart_.count(),
+                        trimEnd_.count()));
+                }
             }
             ApplyPreviewSpeed();
             preview_.UpdateVideo();
+            if (busy_) {
+                awaitingNaturalPlaybackEnd_ = false;
+                playing_ = false;
+                static_cast<void>(preview_.Pause());
+                UpdatePlayButton();
+                break;
+            }
             std::wstring playError;
             if (preview_.Play(&playError)) {
                 playing_ = true;
@@ -2274,15 +2354,32 @@ private:
         request.includeSystemAudio = ShouldIncludeSystemAudio();
         request.playbackSpeedTenths = playbackSpeedTenths_;
         request.qualityPercent = qualityPercent_;
+        if (selectedFormat_ == OutputFormat::Mp4 &&
+            HasPreparedCaptureVideoForCurrentQuality()) {
+            request.recording.sourcePath = recording_.preparedVideo.sourcePath;
+            request.recording.width = recording_.preparedVideo.width;
+            request.recording.height = recording_.preparedVideo.height;
+            request.recording.region = IntRect{
+                0,
+                0,
+                static_cast<int>(recording_.preparedVideo.width),
+                static_cast<int>(recording_.preparedVideo.height)};
+            request.recording.preparedVideo = {};
+            // The prepared recording already contains the selected spatial
+            // quality. Treat it as the 100% source to prevent a second scale.
+            request.qualityPercent = media::ExportQuality::DefaultPercent;
+        }
         request.destinationPath = destination;
         return request;
     }
 
-    [[nodiscard]] bool NeedsWarmCache() const noexcept {
+    [[nodiscard]] bool NeedsWarmCache() const {
+        const ExportRequest effectiveRequest = BuildExportRequest({});
         return selectedFormat_ == OutputFormat::Gif || trimRangeEdited_ ||
             ShouldIncludeSystemAudio() ||
             playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths ||
-            qualityPercent_ < media::ExportQuality::DefaultPercent;
+            effectiveRequest.qualityPercent <
+                media::ExportQuality::DefaultPercent;
     }
 
     void ClearPendingWarmCacheMessages() {
@@ -2351,6 +2448,9 @@ private:
         ++warmCacheGeneration_;
         warmCacheReady_ = false;
         warmCacheInProgress_ = false;
+        activeWarmCacheRequest_.reset();
+        preparedExportArtifact_.Clear();
+        pendingWarmExport_.reset();
         if (warmCacheCoordinatorStarted_) {
             warmCacheCoordinator_.Cancel();
         }
@@ -2428,6 +2528,10 @@ private:
 
     void SchedulePreviewProxy(const UINT debounceMilliseconds) {
         InvalidatePreviewProxyWork();
+        if (HasPreparedCaptureVideoForCurrentQuality()) {
+            SwitchPreviewMedia(recording_.preparedVideo.sourcePath);
+            return;
+        }
         if (qualityPercent_ >= media::ExportQuality::DefaultPercent) {
             SwitchPreviewMedia(recording_.sourcePath);
             return;
@@ -2599,6 +2703,7 @@ private:
         ClearPendingWarmCacheMessages();
         const std::uint64_t generation = warmCacheGeneration_;
         ExportRequest request = BuildExportRequest({});
+        activeWarmCacheRequest_ = request;
         warmCacheInProgress_ = true;
         warmCacheReady_ = false;
         if (!busy_) {
@@ -2622,6 +2727,7 @@ private:
         if (!warmCacheCoordinator_.Submit(generation, std::move(request))) {
             warmCacheInProgress_ = false;
             warmCacheReady_ = false;
+            activeWarmCacheRequest_.reset();
             WriteDiagnostic(L"后台预生成：请求提交失败，导出时将自动重试。");
             if (!busy_) {
                 UpdateReadyStatus();
@@ -2694,6 +2800,14 @@ private:
 
         warmCacheInProgress_ = false;
         warmCacheReady_ = state->result.success;
+        if (state->result.success && activeWarmCacheRequest_.has_value()) {
+            static_cast<void>(preparedExportArtifact_.Store(
+                *activeWarmCacheRequest_,
+                state->result));
+        } else {
+            preparedExportArtifact_.Clear();
+        }
+        activeWarmCacheRequest_.reset();
         if (state->result.success && state->result.outputBytes != 0) {
             SetDisplayedOutputSize(state->result.outputBytes, true);
         }
@@ -2719,6 +2833,23 @@ private:
             state->result.outputPath.wstring(),
             state->result.cacheKey,
             state->result.diagnosticSummary));
+
+        if (pendingWarmExport_.has_value() &&
+            pendingWarmExport_->generation == state->generation) {
+            PendingWarmExportState pending =
+                std::move(*pendingWarmExport_);
+            pendingWarmExport_.reset();
+            SetBusy(false);
+            if (state->result.success &&
+                TryInstantExport(pending.request, pending.action)) {
+                currentExportTimingActive_ = false;
+                return;
+            }
+            BeginExport(
+                pending.request.destinationPath,
+                pending.action);
+            return;
+        }
 
         if (state->result.cancelled) {
             return;
@@ -2756,7 +2887,8 @@ private:
         WriteDiagnostic(std::format(
             L"编辑器导出请求：action={}，format={}，trimStart={} ms，trimEnd={} ms，"
             L"duration={} ms，trimRangeEdited={}，requestStart={} ms，requestEnd={} ms，"
-            L"recordingDuration={} ms，includeSystemAudio={}，speed={:.1f}x，quality={}%，"
+            L"recordingDuration={} ms，includeSystemAudio={}，speed={:.1f}x，"
+            L"quality={}%，effectiveSourceQuality={}%，"
             L"mode={}，source={}，"
             L"audioSource={}，destination={}",
             ExportActionName(action),
@@ -2770,6 +2902,7 @@ private:
             request.recording.duration.count(),
             request.includeSystemAudio ? L"是" : L"否",
             request.playbackSpeedTenths / 10.0,
+            qualityPercent_,
             request.qualityPercent,
             passthrough ? L"原片直通" : L"重新生成媒体",
             request.recording.sourcePath.wstring(),
@@ -2823,6 +2956,101 @@ private:
         }
     }
 
+    [[nodiscard]] std::optional<std::filesystem::path> ResolveInstantArtifact(
+        const ExportRequest& request,
+        bool* const cacheArtifact) const noexcept {
+        if (cacheArtifact != nullptr) {
+            *cacheArtifact = false;
+        }
+        if (MediaExporter::CanUsePassthrough(request)) {
+            return request.recording.sourcePath;
+        }
+        std::optional<std::filesystem::path> prepared =
+            preparedExportArtifact_.Resolve(request);
+        if (prepared.has_value() && cacheArtifact != nullptr) {
+            *cacheArtifact = true;
+        }
+        return prepared;
+    }
+
+    [[nodiscard]] bool TryInstantExport(
+        const ExportRequest& request,
+        const ExportAction action) {
+        bool cacheArtifact = false;
+        const std::optional<std::filesystem::path> artifact =
+            ResolveInstantArtifact(request, &cacheArtifact);
+        if (!artifact.has_value()) {
+            return false;
+        }
+
+        const auto startedAt = std::chrono::steady_clock::now();
+        const media::InstantDeliveryResult delivery =
+            media::InstantArtifactDelivery::TryHardLink(
+                *artifact,
+                request.destinationPath);
+        if (delivery.outcome != media::InstantDeliveryOutcome::Delivered) {
+            return false;
+        }
+
+        EditorExportResult result{};
+        result.success = true;
+        result.format = selectedFormat_;
+        result.finalPath = request.destinationPath;
+        if (action == ExportAction::Copy) {
+            result.copiedToClipboard = MediaExporter::CopyFileToClipboard(
+                window_,
+                request.destinationPath,
+                &result.errorMessage);
+            result.success = result.copiedToClipboard;
+            if (!result.success) {
+                std::error_code ignored;
+                std::filesystem::remove(request.destinationPath, ignored);
+            }
+        }
+
+        const auto wallElapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - startedAt);
+        if (result.success) {
+            estimatedOutputBytes_ = delivery.outputBytes;
+            SetDisplayedOutputSize(delivery.outputBytes, true);
+            SetStatus(
+                action == ExportAction::Copy
+                    ? L"已即时复制，可直接粘贴"
+                    : L"已即时保存：" + request.destinationPath.wstring(),
+                EditorStatusTone::Success);
+        } else {
+            SetStatus(L"复制失败，源录屏已保留。", EditorStatusTone::Error);
+            win32::ShowError(window_, L"复制失败", result.errorMessage);
+        }
+
+        WriteDiagnostic(std::format(
+            L"编辑器导出结果：action={}，format={}，success={}，cancelled=否，"
+            L"includeSystemAudio={}，disposition=PreparedArtifactDirect，"
+            L"delivery={}，cacheHit={}，mediaElapsedUs={}，wallElapsedUs={}，"
+            L"outputBytes={}，source={}，output={}，quality={}%，error={}",
+            ExportActionName(action),
+            OutputFormatName(selectedFormat_),
+            result.success ? L"是" : L"否",
+            request.includeSystemAudio ? L"是" : L"否",
+            MediaExporter::DeliveryName(delivery.delivery),
+            cacheArtifact ? L"是" : L"否",
+            delivery.elapsed.count(),
+            wallElapsed.count(),
+            delivery.outputBytes,
+            artifact->wstring(),
+            request.destinationPath.wstring(),
+            qualityPercent_,
+            result.errorMessage.empty() ? L"无" : result.errorMessage));
+
+        if (callbacks_.exportCompleted) {
+            try {
+                callbacks_.exportCompleted(result);
+            } catch (...) {
+            }
+        }
+        return true;
+    }
+
     void BeginSaveExport() {
         if (exporter_.IsRunning()) {
             return;
@@ -2851,46 +3079,6 @@ private:
 
     void BeginClipboardExport() {
         if (exporter_.IsRunning()) {
-            return;
-        }
-
-        const ExportRequest eligibility = BuildExportRequest(
-            recording_.sourcePath.parent_path() / L"clipboard.mp4");
-        if (MediaExporter::CanUsePassthrough(eligibility)) {
-            const auto startedAt = std::chrono::steady_clock::now();
-            LogExportRequest(eligibility, ExportAction::Copy, true);
-            EditorExportResult result{};
-            result.format = selectedFormat_;
-            result.finalPath = recording_.sourcePath;
-            result.copiedToClipboard = MediaExporter::CopyFileToClipboard(
-                window_, recording_.sourcePath, &result.errorMessage);
-            result.success = result.copiedToClipboard;
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - startedAt);
-            if (result.success) {
-                SetStatus(
-                    L"原始 MP4 已复制，可直接粘贴（未重新编码）",
-                    EditorStatusTone::Success);
-                WriteDiagnostic(std::format(
-                    L"编辑器导出结果：action=复制，format=MP4，success=是，"
-                    L"disposition=ClipboardDirect，elapsed={} ms，output={}",
-                    elapsed.count(),
-                    result.finalPath.wstring()));
-            } else {
-                SetStatus(L"复制失败，源录屏已保留。", EditorStatusTone::Error);
-                WriteDiagnostic(std::format(
-                    L"编辑器导出结果：action=复制，format=MP4，success=否，"
-                    L"disposition=ClipboardDirect，elapsed={} ms，error={}",
-                    elapsed.count(),
-                    result.errorMessage));
-                win32::ShowError(window_, L"复制失败", result.errorMessage);
-            }
-            if (callbacks_.exportCompleted) {
-                try {
-                    callbacks_.exportCompleted(result);
-                } catch (...) {
-                }
-            }
             return;
         }
 
@@ -2947,7 +3135,37 @@ private:
         currentExportStartedAt_ = std::chrono::steady_clock::now();
         currentExportTimingActive_ = true;
         lastExportProgressSignalMilliseconds_.store(0, std::memory_order_release);
+        exportProgressVisibleAfterMilliseconds_.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                currentExportStartedAt_.time_since_epoch()).count() +
+                kProgressVisibilityDelay.count(),
+            std::memory_order_release);
         LogExportRequest(request, action, currentExportPassthrough_);
+        if (TryInstantExport(request, action)) {
+            currentExportTimingActive_ = false;
+            return;
+        }
+        if (NeedsWarmCache()) {
+            if (warmCacheDebounceArmed_) {
+                ::KillTimer(window_, kWarmCacheDebounceTimer);
+                warmCacheDebounceArmed_ = false;
+                StartWarmCache();
+            }
+            if (warmCacheInProgress_) {
+                pendingWarmExport_ = PendingWarmExportState{
+                    warmCacheGeneration_,
+                    request,
+                    action,
+                };
+                SetBusy(true);
+                SetStatus(
+                    action == ExportAction::Copy
+                        ? L"正在完成同一后台成片，完成后立即复制…"
+                        : L"正在完成同一后台成片，完成后立即保存…",
+                    EditorStatusTone::Progress);
+                return;
+            }
+        }
         SetBusy(true);
         SetInitialExportStatus();
 
@@ -2995,6 +3213,10 @@ private:
         auto previous = lastExportProgressSignalMilliseconds_.load(
             std::memory_order_acquire);
         const bool finalProgress = progress.fraction >= 1.0;
+        if (!finalProgress && now < exportProgressVisibleAfterMilliseconds_.load(
+                std::memory_order_acquire)) {
+            return false;
+        }
         while (finalProgress || now - previous >= kProgressUiInterval.count()) {
             if (lastExportProgressSignalMilliseconds_.compare_exchange_weak(
                     previous,
@@ -3226,8 +3448,10 @@ private:
     EditorAudioToggle audioToggle_;
     MediaPreview preview_;
     MediaExporter exporter_;
+    PreparedExportArtifact preparedExportArtifact_;
     RecordingResult recording_;
     std::uint64_t boundaryEncoderGeneration_{};
+    std::filesystem::path boundaryEncoderSourcePath_;
     AppSettings settings_;
     EditorWindowCallbacks callbacks_;
     OutputFormat selectedFormat_{OutputFormat::Mp4};
@@ -3294,6 +3518,8 @@ private:
     bool warmCacheInProgress_{};
     bool warmCacheReady_{};
     bool warmCacheCoordinatorStarted_{};
+    std::optional<ExportRequest> activeWarmCacheRequest_;
+    std::optional<PendingWarmExportState> pendingWarmExport_;
     std::atomic_bool warmCacheProgressMessagePending_{};
     std::atomic_bool warmCacheCompletionMessagePending_{};
     std::mutex warmCachePendingMutex_;
@@ -3314,6 +3540,7 @@ private:
     std::mutex pendingMutex_;
     std::atomic_bool exportProgressMessagePending_{};
     std::atomic<std::int64_t> lastExportProgressSignalMilliseconds_{};
+    std::atomic<std::int64_t> exportProgressVisibleAfterMilliseconds_{};
     std::optional<ExportProgress> pendingProgress_;
     std::optional<MediaExportResult> pendingResult_;
 };

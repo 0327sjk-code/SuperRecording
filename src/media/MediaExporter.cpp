@@ -4,6 +4,7 @@
 
 #include "common/Win32Helpers.h"
 #include "media/AacAudioWriter.h"
+#include "media/BgraFrameScaler.h"
 #include "media/ExportQuality.h"
 #include "media/Mp4BoundaryTrimmer.h"
 #include "media/Mp4Writer.h"
@@ -322,93 +323,6 @@ HRESULT ExtractTopDownBgra(
     IMFSample* sample,
     const SourceVideo& source,
     std::vector<std::uint8_t>* pixels);
-
-class BgraFrameScaler final {
-public:
-    [[nodiscard]] HRESULT Initialize() noexcept {
-        HRESULT result = ::CoCreateInstance(
-            CLSID_WICImagingFactory2,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory_));
-        if (FAILED(result)) {
-            result = ::CoCreateInstance(
-                CLSID_WICImagingFactory,
-                nullptr,
-                CLSCTX_INPROC_SERVER,
-                IID_PPV_ARGS(&factory_));
-        }
-        return result;
-    }
-    [[nodiscard]] HRESULT Scale(
-        const std::span<const std::uint8_t> sourcePixels,
-        const std::uint32_t sourceWidth,
-        const std::uint32_t sourceHeight,
-        const std::uint32_t outputWidth,
-        const std::uint32_t outputHeight,
-        std::vector<std::uint8_t>* outputPixels) const {
-        if (factory_ == nullptr || outputPixels == nullptr ||
-            sourceWidth == 0 || sourceHeight == 0 ||
-            outputWidth == 0 || outputHeight == 0) {
-            return E_INVALIDARG;
-        }
-        const std::uint64_t sourceStride =
-            static_cast<std::uint64_t>(sourceWidth) * 4U;
-        const std::uint64_t sourceBytes = sourceStride * sourceHeight;
-        const std::uint64_t outputStride =
-            static_cast<std::uint64_t>(outputWidth) * 4U;
-        const std::uint64_t outputBytes = outputStride * outputHeight;
-        if (sourcePixels.size() < sourceBytes ||
-            sourceStride > std::numeric_limits<UINT>::max() ||
-            sourceBytes > std::numeric_limits<UINT>::max() ||
-            outputStride > std::numeric_limits<UINT>::max() ||
-            outputBytes > std::numeric_limits<UINT>::max()) {
-            return E_OUTOFMEMORY;
-        }
-        if (sourceWidth == outputWidth && sourceHeight == outputHeight) {
-            outputPixels->assign(
-                sourcePixels.begin(),
-                sourcePixels.begin() + static_cast<std::size_t>(sourceBytes));
-            return S_OK;
-        }
-
-        ComPtr<IWICBitmap> bitmap;
-        HRESULT result = factory_->CreateBitmapFromMemory(
-            sourceWidth,
-            sourceHeight,
-            GUID_WICPixelFormat32bppBGRA,
-            static_cast<UINT>(sourceStride),
-            static_cast<UINT>(sourceBytes),
-            const_cast<BYTE*>(sourcePixels.data()),
-            &bitmap);
-        if (FAILED(result)) {
-            return result;
-        }
-
-        ComPtr<IWICBitmapScaler> scaler;
-        result = factory_->CreateBitmapScaler(&scaler);
-        if (SUCCEEDED(result)) {
-            result = scaler->Initialize(
-                bitmap.Get(),
-                outputWidth,
-                outputHeight,
-                WICBitmapInterpolationModeFant);
-        }
-        if (FAILED(result)) {
-            return result;
-        }
-
-        outputPixels->resize(static_cast<std::size_t>(outputBytes));
-        return scaler->CopyPixels(
-            nullptr,
-            static_cast<UINT>(outputStride),
-            static_cast<UINT>(outputBytes),
-            outputPixels->data());
-    }
-
-private:
-    ComPtr<IWICImagingFactory> factory_;
-};
 
 HRESULT MaterializePassthroughMp4(
     const std::filesystem::path& source,
@@ -1394,7 +1308,7 @@ HRESULT ExportMp4(
         }
         return E_INVALIDARG;
     }
-    BgraFrameScaler frameScaler;
+    media::BgraFrameScaler frameScaler;
     const bool scalingRequired = outputSize.width != source.width ||
         outputSize.height != source.height;
     if (scalingRequired) {
@@ -1495,6 +1409,7 @@ HRESULT ExportMp4(
                 pixels,
                 source.width,
                 source.height,
+                source.width * 4U,
                 outputSize.width,
                 outputSize.height,
                 &scaledPixels);

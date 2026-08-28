@@ -532,13 +532,13 @@ void AppController::StartCapture(const IntRect& requestedRegion) {
 
     activeRecordingPath_ = recordingPath;
     capture::CaptureError error;
-    if (!captureEngine_.Start(
-            requestedRegion,
-            recordingPath,
-            settings_.framesPerSecond,
-            settings_.includeCursor,
-            std::move(callbacks),
-            &error)) {
+    capture::CaptureConfig captureConfig{};
+    captureConfig.region = requestedRegion;
+    captureConfig.outputPath = recordingPath;
+    captureConfig.framesPerSecond = settings_.framesPerSecond;
+    captureConfig.includeCursor = settings_.includeCursor;
+    captureConfig.outputQualityPercent = settings_.outputQualityPercent;
+    if (!captureEngine_.Start(captureConfig, std::move(callbacks), &error)) {
         state_ = RecordingState::Idle;
         const std::wstring text = CaptureErrorText(error);
         logger_.Error(L"开始录制失败：" + text);
@@ -620,6 +620,17 @@ void AppController::AbortCaptureStartup(
                           stoppedResult->systemAudio.sourcePath.wstring());
         }
     }
+    if (stoppedResult.has_value() &&
+        !stoppedResult->preparedVideo.sourcePath.empty()) {
+        cleanupError.clear();
+        if (!DeleteFileIfPresent(
+                stoppedResult->preparedVideo.sourcePath,
+                &cleanupError)) {
+            logger_.Error(L"清理启动失败画质代理失败：" + cleanupError +
+                          L"；路径：" +
+                          stoppedResult->preparedVideo.sourcePath.wstring());
+        }
+    }
     activeRecordingPath_.clear();
     state_ = RecordingState::Idle;
     logger_.Error(L"录制启动已回滚：" + primaryError);
@@ -685,7 +696,8 @@ void AppController::HandleCaptureCompleted(RecordingResult result) {
     activeRecordingPath_ = result.sourcePath;
     logger_.Info(std::format(
         L"录制结束：{} 帧，时长 {} ms，临时文件 {}，电脑声音={}，"
-        L"音频时长={} ms，音频文件={}，状态={}",
+        L"音频时长={} ms，音频文件={}，状态={}，实时画质代理={}，"
+        L"代理画质={}%，代理尺寸={}x{}，代理帧数={}，代理文件={}，代理状态={}",
         captureEngine_.Stats().encodedFrames,
         result.duration.count(),
         result.sourcePath.wstring(),
@@ -696,7 +708,18 @@ void AppController::HandleCaptureCompleted(RecordingResult result) {
             : result.systemAudio.sourcePath.wstring(),
         result.systemAudio.statusMessage.empty()
             ? L"无"
-            : result.systemAudio.statusMessage));
+            : result.systemAudio.statusMessage,
+        result.preparedVideo.available ? L"可用" : L"不可用",
+        result.preparedVideo.qualityPercent,
+        result.preparedVideo.width,
+        result.preparedVideo.height,
+        result.preparedVideo.encodedFrames,
+        result.preparedVideo.sourcePath.empty()
+            ? L"无"
+            : result.preparedVideo.sourcePath.wstring(),
+        result.preparedVideo.statusMessage.empty()
+            ? L"无"
+            : result.preparedVideo.statusMessage));
     if (exitAfterFinalize_ || shuttingDown_) {
         if (window_ != nullptr) {
             CompleteExit();

@@ -41,6 +41,7 @@ struct CaptureConfig final {
     std::filesystem::path outputPath;
     int framesPerSecond{60};
     bool includeCursor{true};
+    int outputQualityPercent{100};
 };
 
 struct CaptureCallbacks final {

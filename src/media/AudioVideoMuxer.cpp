@@ -116,6 +116,7 @@ struct VideoReadState final {
     LONGLONG previousSourceTime{-1};
     LONGLONG previousSourceEnd{-1};
     LONGLONG lastOutputEnd{};
+    LONGLONG lastOutputSampleDuration{};
     PendingSample pending;
     bool firstSample{true};
     bool endOfStream{};
@@ -426,6 +427,30 @@ struct AudioReadState final {
     return MakeStep(AudioVideoMuxOutcome::Succeeded, S_OK);
 }
 
+[[nodiscard]] bool CoversExpectedVideoEnd(
+    const VideoReadState& state) noexcept {
+    if (state.firstSample || state.lastOutputEnd <= 0) {
+        return false;
+    }
+    const LONGLONG uncoveredDuration = std::max<LONGLONG>(
+        0,
+        state.outputDuration - state.lastOutputEnd);
+    // Timeline controls store frame-quantized positions in milliseconds. At
+    // 30/60 FPS that representation can round the requested end up by almost
+    // one frame even though the trimmed H.264 stream is complete. Accept only
+    // that final-frame rounding interval; a materially truncated stream still
+    // fails the coverage check.
+    const LONGLONG frameRounding = std::max(
+        kTimestampToleranceTicks,
+        state.lastOutputSampleDuration);
+    const LONGLONG permittedRounding =
+        frameRounding >
+                std::numeric_limits<LONGLONG>::max() - kTimestampToleranceTicks
+            ? std::numeric_limits<LONGLONG>::max()
+            : frameRounding + kTimestampToleranceTicks;
+    return uncoveredDuration <= permittedRounding;
+}
+
 [[nodiscard]] StepResult ReadNextVideoSample(
     VideoReadState* state,
     const std::stop_token stopToken) {
@@ -481,9 +506,7 @@ struct AudioReadState final {
         if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0 ||
             sampleTime >= state->outputDuration) {
             state->endOfStream = true;
-            if (state->firstSample ||
-                state->lastOutputEnd + kTimestampToleranceTicks <
-                    state->outputDuration) {
+            if (!CoversExpectedVideoEnd(*state)) {
                 return MakeStep(
                     AudioVideoMuxOutcome::Unsupported,
                     MF_E_END_OF_STREAM,
@@ -549,6 +572,7 @@ struct AudioReadState final {
         }
         state->firstSample = false;
         state->lastOutputEnd = sampleTime + sampleDuration;
+        state->lastOutputSampleDuration = sampleDuration;
         state->pending.sample = std::move(sample);
         state->pending.outputTime = sampleTime;
         state->pending.duration = sampleDuration;
@@ -1375,8 +1399,7 @@ AudioVideoMuxResult AudioVideoMuxer::Mux(
         }
 
         if (result.videoSamples == 0 || result.audioSamples == 0 ||
-            videoState.lastOutputEnd + kTimestampToleranceTicks <
-                outputDuration) {
+            !CoversExpectedVideoEnd(videoState)) {
             return MakeResult(
                 AudioVideoMuxOutcome::Unsupported,
                 MF_E_END_OF_STREAM,

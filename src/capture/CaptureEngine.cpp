@@ -8,7 +8,9 @@
 #include "CaptureEngine.h"
 
 #include "DesktopDuplicator.h"
+#include "RecordingQualityProxy.h"
 #include "SystemAudioCapture.h"
+#include "../media/ExportQuality.h"
 #include "../media/Mp4Writer.h"
 
 #include <windows.h>
@@ -93,6 +95,14 @@ void AssignError(CaptureError* destination, const CaptureError& source) {
     const std::filesystem::path& videoPath) {
     return videoPath.parent_path() /
         (videoPath.stem().wstring() + L".system-audio.m4a");
+}
+
+[[nodiscard]] std::filesystem::path QualityProxyPathFor(
+    const std::filesystem::path& videoPath,
+    const int qualityPercent) {
+    return videoPath.parent_path() /
+        (videoPath.stem().wstring() + L".quality-" +
+         std::to_wstring(qualityPercent) + L".mp4");
 }
 
 [[nodiscard]] std::wstring SystemAudioErrorText(
@@ -283,6 +293,44 @@ struct CaptureEngine::Impl final {
             return;
         }
 
+        RecordingQualityProxy qualityProxy;
+        RecordingQualityProxyResult qualityProxyResult{};
+        bool qualityProxyStarted = false;
+        bool qualityProxyAccepting = false;
+        if (config.outputQualityPercent < media::ExportQuality::DefaultPercent) {
+            const media::ExportPixelSize proxySize =
+                media::ExportQuality::ComputeMp4Size(
+                    static_cast<std::uint32_t>(config.region.Width()),
+                    static_cast<std::uint32_t>(config.region.Height()),
+                    config.outputQualityPercent);
+            const std::filesystem::path proxyPath = QualityProxyPathFor(
+                config.outputPath,
+                config.outputQualityPercent);
+            std::wstring proxyStartError;
+            qualityProxyStarted = qualityProxy.Start(
+                RecordingQualityProxyConfig{
+                    proxyPath,
+                    static_cast<std::uint32_t>(config.region.Width()),
+                    static_cast<std::uint32_t>(config.region.Height()),
+                    proxySize.width,
+                    proxySize.height,
+                    config.framesPerSecond,
+                    config.outputQualityPercent,
+                },
+                &proxyStartError);
+            qualityProxyAccepting = qualityProxyStarted;
+            if (!qualityProxyStarted) {
+                qualityProxyResult.attempted = true;
+                qualityProxyResult.outputPath = proxyPath;
+                qualityProxyResult.outputWidth = proxySize.width;
+                qualityProxyResult.outputHeight = proxySize.height;
+                qualityProxyResult.qualityPercent = config.outputQualityPercent;
+                qualityProxyResult.errorMessage = proxyStartError.empty()
+                    ? L"实时画质代理启动失败；编辑器将按需后台生成。"
+                    : std::move(proxyStartError);
+            }
+        }
+
         const std::filesystem::path systemAudioPath =
             SystemAudioPathFor(config.outputPath);
         RemoveFileBestEffort(systemAudioPath);
@@ -455,6 +503,14 @@ struct CaptureEngine::Impl final {
                     nativeError);
                 break;
             }
+            if (qualityProxyAccepting &&
+                !qualityProxy.SubmitFrame(
+                    latestFrame.bgra,
+                    latestFrame.stride,
+                    timestamp,
+                    sampleDuration)) {
+                qualityProxyAccepting = false;
+            }
 
             if (firstVideoFrame && systemAudioStarted) {
                 {
@@ -579,17 +635,41 @@ struct CaptureEngine::Impl final {
                 finalizeNativeError);
         }
 
+        if (qualityProxyStarted) {
+            if (runtimeError) {
+                qualityProxy.Cancel();
+                qualityProxyResult.attempted = true;
+                qualityProxyResult.qualityPercent = config.outputQualityPercent;
+                qualityProxyResult.errorMessage =
+                    L"主录屏未完成，实时画质代理已丢弃。";
+            } else {
+                qualityProxyResult = qualityProxy.Finish();
+            }
+        }
+
         std::optional<RecordingResult> result;
         if (!runtimeError) {
-            result = RecordingResult{
-                config.outputPath,
-                config.region,
-                config.framesPerSecond,
-                static_cast<std::uint32_t>(config.region.Width()),
-                static_cast<std::uint32_t>(config.region.Height()),
-                std::chrono::milliseconds(encodedDuration100Nanoseconds / 10'000),
-                std::move(systemAudioRecording),
-            };
+            RecordingResult completed{};
+            completed.sourcePath = config.outputPath;
+            completed.region = config.region;
+            completed.framesPerSecond = config.framesPerSecond;
+            completed.width = static_cast<std::uint32_t>(config.region.Width());
+            completed.height = static_cast<std::uint32_t>(config.region.Height());
+            completed.duration = std::chrono::milliseconds(
+                encodedDuration100Nanoseconds / 10'000);
+            completed.systemAudio = std::move(systemAudioRecording);
+            completed.preparedVideo.sourcePath = qualityProxyResult.outputPath;
+            completed.preparedVideo.available = qualityProxyResult.success;
+            completed.preparedVideo.qualityPercent =
+                qualityProxyResult.qualityPercent;
+            completed.preparedVideo.width = qualityProxyResult.outputWidth;
+            completed.preparedVideo.height = qualityProxyResult.outputHeight;
+            completed.preparedVideo.encodedFrames =
+                qualityProxyResult.encodedFrames;
+            completed.preparedVideo.statusMessage = qualityProxyResult.success
+                ? L"录制期间已同步生成当前画质成片"
+                : qualityProxyResult.errorMessage;
+            result = std::move(completed);
         } else {
             RemoveFileBestEffort(systemAudioPath);
         }
@@ -666,6 +746,8 @@ bool CaptureEngine::Start(
 
     CaptureConfig config = requestedConfig;
     config.region = NormalizeToEvenRegion(config.region);
+    config.outputQualityPercent = media::ExportQuality::Normalize(
+        config.outputQualityPercent);
     if (!config.region.IsValid() || config.outputPath.empty() ||
         (config.framesPerSecond != 30 && config.framesPerSecond != 60)) {
         AssignError(

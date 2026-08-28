@@ -60,6 +60,16 @@ struct SystemAudioRecording final {
     std::wstring statusMessage;
 };
 
+struct PreparedVideoRecording final {
+    std::filesystem::path sourcePath;
+    bool available{};
+    int qualityPercent{100};
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::uint64_t encodedFrames{};
+    std::wstring statusMessage;
+};
+
 struct RecordingResult final {
     std::filesystem::path sourcePath;
     IntRect region{};
@@ -68,6 +78,7 @@ struct RecordingResult final {
     std::uint32_t height{};
     std::chrono::milliseconds duration{};
     SystemAudioRecording systemAudio;
+    PreparedVideoRecording preparedVideo;
 };
 
 struct ExportRequest final {
