@@ -799,6 +799,7 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const int rangeY = layout.editorPanelTop + Scale(window, 16);
     const int compactButtonWidth = Scale(window, 32);
     const int compactButtonGap = Scale(window, 6);
+    const int toolbarGroupGap = Scale(window, 12);
     const int speedGap = Scale(window, 10);
     const int speedWidth = Scale(window, EditorSpeedControl::PreferredWidthDip);
     const int qualityGap = Scale(window, 8);
@@ -824,7 +825,13 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const int secondaryToolY = compact
         ? rangeY + Scale(window, 38)
         : rangeY;
-    int secondaryToolbarRight = width - margin;
+    // At standard width the trim-boundary buttons share this row with the
+    // quality/size/speed toolbar. Reserve the complete trim-button group before
+    // laying out the speed control so sibling child windows never overlap.
+    // Compact mode already moves the secondary toolbar to its own row.
+    int secondaryToolbarRight = compact
+        ? width - margin
+        : static_cast<int>(layout.trimStartButton.left) - toolbarGroupGap;
     secondaryToolbarRight -= speedWidth;
     SetRect(
         layout.speedControl,
