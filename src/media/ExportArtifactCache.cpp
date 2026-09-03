@@ -27,7 +27,7 @@ using namespace std::chrono_literals;
 constexpr std::wstring_view kArtifactPrefix = L"qrec-artifact-";
 constexpr std::wstring_view kStagingPrefix = L"qrec-cache-staging-";
 constexpr std::wstring_view kCacheVersion =
-    L"qrec-export-cache-v10-quality-percent";
+    L"qrec-export-cache-v11-effective-video-timeline";
 constexpr auto kArtifactRetention = std::chrono::hours(24 * 7);
 constexpr auto kStagingRetention = std::chrono::hours(24);
 

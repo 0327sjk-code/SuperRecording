@@ -38,7 +38,9 @@ struct AudioVideoMuxRequest final {
     std::filesystem::path trimmedVideoPath;
 
     // Full-recording AAC-in-M4A/MP4 sidecar. Its timestamps must use the same
-    // recording clock as trimStart/trimEnd.
+    // recording clock as trimStart/trimEnd. When frame quantization moves the
+    // trimmed video's effective start forward, Mux aligns this audio range to
+    // the video's measured end instead of assuming millisecond-exact coverage.
     std::filesystem::path audioSidecarPath;
     std::filesystem::path destinationPath;
     std::chrono::milliseconds trimStart{};
@@ -54,8 +56,17 @@ struct AudioVideoMuxResult final {
     std::uint64_t videoSamples{};
     std::uint64_t audioSamples{};
 
-    // These gaps are measured against [trimStart, trimEnd]. They include the
-    // access-unit boundary loss and any gap already present in the sidecar.
+    // Timeline diagnostics after the already-trimmed video has been measured.
+    // The difference between requestedDuration and videoDuration is the
+    // frame-quantized start adjustment applied to the audio sidecar.
+    std::chrono::nanoseconds requestedDuration{};
+    std::chrono::nanoseconds videoDuration{};
+    std::chrono::nanoseconds videoStartAdjustment{};
+    std::chrono::nanoseconds effectiveAudioTrimStart{};
+    std::chrono::nanoseconds effectiveAudioTrimEnd{};
+
+    // These gaps are measured against the effective audio range above. They
+    // include access-unit boundary loss and any gap already in the sidecar.
     std::chrono::nanoseconds audioLeadingGap{};
     std::chrono::nanoseconds audioTrailingGap{};
     bool droppedLeadingBoundaryAccessUnit{};

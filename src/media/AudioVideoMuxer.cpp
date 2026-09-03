@@ -1,6 +1,7 @@
 #include "media/AudioVideoMuxer.h"
 
 #include "common/Win32Helpers.h"
+#include "media/CompressedTimelineAlignment.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -29,6 +30,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr LONGLONG kTicksPerMillisecond = 10'000;
+constexpr LONGLONG kTicksPerSecond = 10'000'000;
 constexpr LONGLONG kNanosecondsPerTick = 100;
 constexpr LONGLONG kTimestampToleranceTicks = 2;
 constexpr LONGLONG kAudioBoundaryProbePrerollTicks = 10'000'000;
@@ -38,6 +40,8 @@ constexpr DWORD kVideoStream =
     static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 constexpr DWORD kAudioStream =
     static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+constexpr DWORD kMediaSource =
+    static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE);
 
 class MediaFoundationSession final {
 public:
@@ -113,10 +117,12 @@ struct PendingSample final {
 struct VideoReadState final {
     IMFSourceReader* reader{};
     LONGLONG outputDuration{};
+    LONGLONG requestedDuration{};
+    LONGLONG nominalFrameDuration{};
+    LONGLONG maximumSourceSampleDuration{};
     LONGLONG previousSourceTime{-1};
     LONGLONG previousSourceEnd{-1};
     LONGLONG lastOutputEnd{};
-    LONGLONG lastOutputSampleDuration{};
     PendingSample pending;
     bool firstSample{true};
     bool endOfStream{};
@@ -183,6 +189,75 @@ struct AudioReadState final {
     const LONGLONG value) noexcept {
     return std::chrono::nanoseconds(
         std::max<LONGLONG>(0, value) * kNanosecondsPerTick);
+}
+
+[[nodiscard]] StepResult ReadPresentationDuration(
+    IMFSourceReader* reader,
+    LONGLONG* output) {
+    if (reader == nullptr || output == nullptr) {
+        return MakeStep(
+            AudioVideoMuxOutcome::Failed,
+            E_POINTER,
+            L"读取压缩视频时长时收到空指针。");
+    }
+    *output = 0;
+
+    PROPVARIANT duration{};
+    ::PropVariantInit(&duration);
+    const HRESULT readResult = reader->GetPresentationAttribute(
+        kMediaSource,
+        MF_PD_DURATION,
+        &duration);
+    if (FAILED(readResult)) {
+        ::PropVariantClear(&duration);
+        return MakeStep(
+            AudioVideoMuxOutcome::Unsupported,
+            readResult,
+            ErrorText(L"读取 H.264 轨道实际时长失败", readResult));
+    }
+
+    bool valid = false;
+    if (duration.vt == VT_UI8 &&
+        duration.uhVal.QuadPart <= static_cast<ULONGLONG>(
+            std::numeric_limits<LONGLONG>::max())) {
+        *output = static_cast<LONGLONG>(duration.uhVal.QuadPart);
+        valid = *output > 0;
+    } else if (duration.vt == VT_I8) {
+        *output = duration.hVal.QuadPart;
+        valid = *output > 0;
+    }
+    ::PropVariantClear(&duration);
+    if (!valid) {
+        *output = 0;
+        return MakeStep(
+            AudioVideoMuxOutcome::Unsupported,
+            MF_E_INVALID_TIMESTAMP,
+            L"H.264 轨道缺少有效的实际时长。");
+    }
+    return MakeStep(AudioVideoMuxOutcome::Succeeded, S_OK);
+}
+
+[[nodiscard]] LONGLONG NominalVideoFrameDuration(
+    IMFMediaType* mediaType) noexcept {
+    if (mediaType == nullptr) {
+        return 0;
+    }
+    UINT32 numerator = 0;
+    UINT32 denominator = 0;
+    if (FAILED(::MFGetAttributeRatio(
+            mediaType,
+            MF_MT_FRAME_RATE,
+            &numerator,
+            &denominator)) ||
+        numerator == 0 || denominator == 0 ||
+        denominator > static_cast<UINT32>(
+            std::numeric_limits<LONGLONG>::max() / kTicksPerSecond)) {
+        return 0;
+    }
+    const LONGLONG scaled = kTicksPerSecond * denominator;
+    return std::max<LONGLONG>(
+        1,
+        (scaled + static_cast<LONGLONG>(numerator) / 2) / numerator);
 }
 
 [[nodiscard]] HRESULT SeekReader(
@@ -435,20 +510,10 @@ struct AudioReadState final {
     const LONGLONG uncoveredDuration = std::max<LONGLONG>(
         0,
         state.outputDuration - state.lastOutputEnd);
-    // Timeline controls store frame-quantized positions in milliseconds. At
-    // 30/60 FPS that representation can round the requested end up by almost
-    // one frame even though the trimmed H.264 stream is complete. Accept only
-    // that final-frame rounding interval; a materially truncated stream still
-    // fails the coverage check.
-    const LONGLONG frameRounding = std::max(
-        kTimestampToleranceTicks,
-        state.lastOutputSampleDuration);
-    const LONGLONG permittedRounding =
-        frameRounding >
-                std::numeric_limits<LONGLONG>::max() - kTimestampToleranceTicks
-            ? std::numeric_limits<LONGLONG>::max()
-            : frameRounding + kTimestampToleranceTicks;
-    return uncoveredDuration <= permittedRounding;
+    // outputDuration is the measured duration of the already-trimmed video.
+    // Only the MP4 timescale round trip is tolerated here; frame quantization
+    // is validated separately against requestedDuration.
+    return uncoveredDuration <= kTimestampToleranceTicks;
 }
 
 [[nodiscard]] StepResult ReadNextVideoSample(
@@ -526,6 +591,9 @@ struct AudioReadState final {
                 MF_E_INVALID_TIMESTAMP,
                 L"H.264 压缩样本缺少有效时长。");
         }
+        state->maximumSourceSampleDuration = std::max(
+            state->maximumSourceSampleDuration,
+            sampleDuration);
         StepResult step = ValidateSampleTimeline(
             sampleTime,
             sampleDuration,
@@ -572,7 +640,6 @@ struct AudioReadState final {
         }
         state->firstSample = false;
         state->lastOutputEnd = sampleTime + sampleDuration;
-        state->lastOutputSampleDuration = sampleDuration;
         state->pending.sample = std::move(sample);
         state->pending.outputTime = sampleTime;
         state->pending.duration = sampleDuration;
@@ -1282,14 +1349,44 @@ AudioVideoMuxResult AudioVideoMuxer::Mux(
             return ResultFromStep(std::move(step), std::move(result));
         }
 
+        LONGLONG measuredVideoDuration = 0;
+        step = ReadPresentationDuration(
+            video.reader.Get(),
+            &measuredVideoDuration);
+        if (!step.Succeeded()) {
+            return ResultFromStep(std::move(step), std::move(result));
+        }
+        media::CompressedTimelineAlignment alignment{};
+        if (!media::TryAlignCompressedVideoToRange(
+                trimStart,
+                trimEnd,
+                measuredVideoDuration,
+                &alignment)) {
+            return MakeResult(
+                AudioVideoMuxOutcome::Unsupported,
+                MF_E_INVALID_TIMESTAMP,
+                L"H.264 轨道实际时长无效。");
+        }
+
+        result.requestedDuration = TicksToNanoseconds(
+            alignment.requestedDurationTicks);
+        result.videoDuration = TicksToNanoseconds(
+            alignment.outputDurationTicks);
+        result.videoStartAdjustment = TicksToNanoseconds(
+            alignment.videoStartAdjustmentTicks);
+        result.effectiveAudioTrimStart = TicksToNanoseconds(
+            alignment.effectiveAudioTrimStartTicks);
+        result.effectiveAudioTrimEnd = TicksToNanoseconds(
+            alignment.effectiveAudioTrimEndTicks);
+
         HRESULT nativeResult = SeekReader(video.reader.Get(), 0);
         if (SUCCEEDED(nativeResult)) {
             nativeResult = SeekReader(
                 audio.reader.Get(),
                 std::max<LONGLONG>(
                     0,
-                    trimStart - std::min(
-                        trimStart,
+                    alignment.effectiveAudioTrimStartTicks - std::min(
+                        alignment.effectiveAudioTrimStartTicks,
                         kAudioBoundaryProbePrerollTicks)));
         }
         if (FAILED(nativeResult)) {
@@ -1299,14 +1396,16 @@ AudioVideoMuxResult AudioVideoMuxer::Mux(
                 ErrorText(L"定位音视频重封装起点失败", nativeResult));
         }
 
-        const LONGLONG outputDuration = trimEnd - trimStart;
         VideoReadState videoState{};
         videoState.reader = video.reader.Get();
-        videoState.outputDuration = outputDuration;
+        videoState.outputDuration = alignment.outputDurationTicks;
+        videoState.requestedDuration = alignment.requestedDurationTicks;
+        videoState.nominalFrameDuration = NominalVideoFrameDuration(
+            video.nativeType.Get());
         AudioReadState audioState{};
         audioState.reader = audio.reader.Get();
-        audioState.trimStart = trimStart;
-        audioState.trimEnd = trimEnd;
+        audioState.trimStart = alignment.effectiveAudioTrimStartTicks;
+        audioState.trimEnd = alignment.effectiveAudioTrimEndTicks;
 
         step = ReadNextVideoSample(&videoState, stopToken);
         if (!step.Succeeded()) {
@@ -1398,12 +1497,34 @@ AudioVideoMuxResult AudioVideoMuxer::Mux(
             }
         }
 
-        if (result.videoSamples == 0 || result.audioSamples == 0 ||
-            !CoversExpectedVideoEnd(videoState)) {
-            return MakeResult(
-                AudioVideoMuxOutcome::Unsupported,
-                MF_E_END_OF_STREAM,
-                L"音视频轨道没有完整覆盖可重封装区间。");
+        if (result.videoSamples == 0 || result.audioSamples == 0) {
+            return ResultFromStep(
+                MakeStep(
+                    AudioVideoMuxOutcome::Unsupported,
+                    MF_E_END_OF_STREAM,
+                    L"音视频轨道没有可写入的压缩样本。"),
+                std::move(result));
+        }
+        if (!CoversExpectedVideoEnd(videoState)) {
+            return ResultFromStep(
+                MakeStep(
+                    AudioVideoMuxOutcome::Unsupported,
+                    MF_E_END_OF_STREAM,
+                    L"H.264 轨道没有覆盖其实际媒体时长。"),
+                std::move(result));
+        }
+        if (!media::CoversFrameQuantizedRequestedSpan(
+                videoState.requestedDuration,
+                videoState.outputDuration,
+                videoState.nominalFrameDuration,
+                videoState.maximumSourceSampleDuration,
+                kTimestampToleranceTicks)) {
+            return ResultFromStep(
+                MakeStep(
+                    AudioVideoMuxOutcome::Unsupported,
+                    MF_E_END_OF_STREAM,
+                    L"H.264 轨道比请求区间短超过一个视频帧。"),
+                std::move(result));
         }
         if (stopToken.stop_requested()) {
             return MakeResult(
@@ -1430,7 +1551,9 @@ AudioVideoMuxResult AudioVideoMuxer::Mux(
         result.errorMessage.clear();
         result.audioLeadingGap = TicksToNanoseconds(firstAudioTime);
         result.audioTrailingGap = TicksToNanoseconds(
-            std::max<LONGLONG>(0, outputDuration - audioState.lastOutputEnd));
+            std::max<LONGLONG>(
+                0,
+                alignment.outputDurationTicks - audioState.lastOutputEnd));
         result.droppedLeadingBoundaryAccessUnit =
             audioState.droppedLeadingBoundaryAccessUnit;
         result.droppedTrailingBoundaryAccessUnit =

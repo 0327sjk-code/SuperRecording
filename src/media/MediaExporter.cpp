@@ -2036,7 +2036,10 @@ MediaExportResult PrepareCachedArtifact(
             : std::format(
                 L"audioMux=true; audioRetimed={}; speedTenths={}; "
                 L"videoDisposition={}; videoCacheHit={}; "
-                L"videoSamples={}; audioSamples={}; audioLeadingGapNs={}; "
+                L"videoSamples={}; audioSamples={}; requestedDurationNs={}; "
+                L"videoDurationNs={}; videoStartAdjustmentNs={}; "
+                L"effectiveAudioTrimStartNs={}; effectiveAudioTrimEndNs={}; "
+                L"audioLeadingGapNs={}; "
                 L"audioTrailingGapNs={}; droppedLeadingAccessUnit={}; "
                 L"droppedTrailingAccessUnit={}; muxError={}",
                 audioRetimed ? L"true" : L"false",
@@ -2045,6 +2048,11 @@ MediaExportResult PrepareCachedArtifact(
                 videoResult.cacheHit ? L"true" : L"false",
                 muxResult.videoSamples,
                 muxResult.audioSamples,
+                muxResult.requestedDuration.count(),
+                muxResult.videoDuration.count(),
+                muxResult.videoStartAdjustment.count(),
+                muxResult.effectiveAudioTrimStart.count(),
+                muxResult.effectiveAudioTrimEnd.count(),
                 muxResult.audioLeadingGap.count(),
                 muxResult.audioTrailingGap.count(),
                 muxResult.droppedLeadingBoundaryAccessUnit ? L"true" : L"false",
