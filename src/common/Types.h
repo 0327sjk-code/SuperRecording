@@ -57,6 +57,13 @@ struct SystemAudioRecording final {
     std::uint32_t sampleRate{};
     std::uint16_t channels{};
     std::chrono::milliseconds duration{};
+    std::uint32_t averageBitrate{};
+    std::uint64_t encodedFrames{};
+    std::uint64_t silentFrames{};
+    std::uint64_t syntheticSilentFrames{};
+    std::uint64_t catchUpSilentFrames{};
+    std::uint64_t catchUpEventCount{};
+    std::uint64_t discontinuityCount{};
     std::wstring statusMessage;
 };
 

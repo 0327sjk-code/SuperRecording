@@ -696,7 +696,9 @@ void AppController::HandleCaptureCompleted(RecordingResult result) {
     activeRecordingPath_ = result.sourcePath;
     logger_.Info(std::format(
         L"录制结束：{} 帧，时长 {} ms，临时文件 {}，电脑声音={}，"
-        L"音频时长={} ms，音频文件={}，状态={}，实时画质代理={}，"
+        L"音频时长={} ms，音频文件={}，音频码率={} bps，"
+        L"音频帧={}，静音帧={}，合成静音帧={}，追赶静音帧={}，"
+        L"追赶次数={}，音频不连续次数={}，状态={}，实时画质代理={}，"
         L"代理画质={}%，代理尺寸={}x{}，代理帧数={}，代理文件={}，代理状态={}",
         captureEngine_.Stats().encodedFrames,
         result.duration.count(),
@@ -706,6 +708,13 @@ void AppController::HandleCaptureCompleted(RecordingResult result) {
         result.systemAudio.sourcePath.empty()
             ? L"无"
             : result.systemAudio.sourcePath.wstring(),
+        result.systemAudio.averageBitrate,
+        result.systemAudio.encodedFrames,
+        result.systemAudio.silentFrames,
+        result.systemAudio.syntheticSilentFrames,
+        result.systemAudio.catchUpSilentFrames,
+        result.systemAudio.catchUpEventCount,
+        result.systemAudio.discontinuityCount,
         result.systemAudio.statusMessage.empty()
             ? L"无"
             : result.systemAudio.statusMessage,

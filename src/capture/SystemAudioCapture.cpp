@@ -7,6 +7,7 @@
 
 #include "SystemAudioCapture.h"
 
+#include "capture/SystemAudioTimelinePolicy.h"
 #include "../media/AacAudioWriter.h"
 
 #include <windows.h>
@@ -59,9 +60,10 @@ inline constexpr std::uint32_t kMinimumAacSeedMilliseconds = 100;
 inline constexpr auto kCaptureWaitTimeout = 250ms;
 inline constexpr auto kStatsCallbackInterval = 250ms;
 inline constexpr auto kSilenceCatchUpHoldback = kCaptureWaitTimeout;
-inline constexpr auto kPendingPacketBudget =
-    kSilenceCatchUpHoldback +
+inline constexpr auto kLatePacketGrace =
     2 * std::chrono::milliseconds(kRequestedBufferMilliseconds);
+inline constexpr auto kPendingPacketBudget =
+    kSilenceCatchUpHoldback + kLatePacketGrace;
 inline constexpr auto kMaximumPacketFutureSkew =
     2 * std::chrono::milliseconds(kRequestedBufferMilliseconds);
 
@@ -711,7 +713,7 @@ public:
                         desiredStartFrame,
                         *maximumEncodedFrames);
                 }
-                if (!WriteSilence(
+                if (!WriteSyntheticSilence(
                         desiredStartFrame - stats_.encodedFrames,
                         error)) {
                     return false;
@@ -750,7 +752,8 @@ public:
                         gapFrames,
                         *maximumEncodedFrames - stats_.encodedFrames);
                 }
-                if (gapFrames != 0 && !WriteSilence(gapFrames, error)) {
+                if (gapFrames != 0 &&
+                    !WriteSyntheticSilence(gapFrames, error)) {
                     return false;
                 }
                 if (maximumEncodedFrames.has_value() &&
@@ -809,6 +812,7 @@ public:
                 outputSamples,
                 outputFrames,
                 silent,
+                false,
                 error)) {
             return false;
         }
@@ -881,7 +885,9 @@ public:
         if (targetFrames <= stats_.encodedFrames) {
             return true;
         }
-        if (!WriteSilence(targetFrames - stats_.encodedFrames, error)) {
+        if (!WriteSyntheticSilence(
+                targetFrames - stats_.encodedFrames,
+                error)) {
             return false;
         }
         ResetDeviceBaseline();
@@ -899,7 +905,7 @@ public:
         if (targetFrames == 0 && stats_.encodedFrames == 0) {
             // Sink Writer 不能封口一个从未接收样本的 M4A。写入仅用于让
             // Finalize 安全完成；零时长调用不能返回一条伪装成 exact 的音轨。
-            if (!WriteSilence(
+            if (!WriteSyntheticSilence(
                     std::max<std::uint64_t>(
                         1,
                         static_cast<std::uint64_t>(sampleRate_) *
@@ -925,21 +931,26 @@ public:
             return true;
         }
 
-        const auto holdback =
+        const SystemAudioCatchUpPlan plan = PlanSystemAudioSilenceCatchUp(
+            activeDuration,
+            stats_.encodedFrames,
+            sampleRate_,
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                kSilenceCatchUpHoldback);
-        if (activeDuration <= holdback) {
+                kSilenceCatchUpHoldback),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                kLatePacketGrace));
+        if (plan.silenceFrames == 0) {
             return true;
         }
-        const std::chrono::nanoseconds committedDuration =
-            activeDuration - holdback;
-        const std::uint64_t targetFrames = FramesForDurationCeiling(
-            committedDuration,
-            sampleRate_);
-        if (targetFrames <= stats_.encodedFrames) {
-            return true;
+        if (!WriteSyntheticSilence(plan.silenceFrames, error)) {
+            return false;
         }
-        return EnsureMinimumDuration(committedDuration, error);
+        stats_.catchUpSilentFrames += plan.silenceFrames;
+        ++stats_.catchUpEventCount;
+        ResetDeviceBaseline();
+        alignmentRequired_ =
+            segmentQpcStart100Nanoseconds_.has_value();
+        return true;
     }
 
 private:
@@ -954,7 +965,9 @@ private:
             return false;
         }
         if (stats_.encodedFrames < targetFrames &&
-            !WriteSilence(targetFrames - stats_.encodedFrames, error)) {
+            !WriteSyntheticSilence(
+                targetFrames - stats_.encodedFrames,
+                error)) {
             return false;
         }
         ResetDeviceBaseline();
@@ -982,7 +995,7 @@ private:
         hasDevicePosition_ = true;
     }
 
-    [[nodiscard]] bool WriteSilence(
+    [[nodiscard]] bool WriteSyntheticSilence(
         std::uint64_t frameCount,
         SystemAudioCaptureError& error) noexcept {
         const std::uint64_t maximumChunkFrames = std::max<std::uint64_t>(
@@ -992,7 +1005,7 @@ private:
         while (frameCount != 0) {
             const std::uint32_t chunkFrames = static_cast<std::uint32_t>(
                 std::min(frameCount, maximumChunkFrames));
-            if (!WriteFrames({}, chunkFrames, true, error)) {
+            if (!WriteFrames({}, chunkFrames, true, true, error)) {
                 return false;
             }
             frameCount -= chunkFrames;
@@ -1004,6 +1017,7 @@ private:
         const std::span<const std::byte> samples,
         const std::uint32_t frameCount,
         const bool silent,
+        const bool syntheticSilence,
         SystemAudioCaptureError& error) noexcept {
         if (frameCount == 0) {
             return true;
@@ -1049,6 +1063,9 @@ private:
         stats_.encodedFrames += frameCount;
         if (silent) {
             stats_.silentFrames += frameCount;
+        }
+        if (syntheticSilence) {
+            stats_.syntheticSilentFrames += frameCount;
         }
         stats_.activeDuration = DurationForFrames(
             stats_.encodedFrames,
@@ -1759,6 +1776,10 @@ struct SystemAudioCapture::Impl final {
                           config.channelCount),
                 finalStats.encodedFrames,
                 finalStats.silentFrames,
+                finalStats.syntheticSilentFrames,
+                finalStats.catchUpSilentFrames,
+                finalStats.catchUpEventCount,
+                finalStats.discontinuityCount,
             };
         }
 

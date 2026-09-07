@@ -1,3 +1,5 @@
+#include "capture/SystemAudioCapture.h"
+#include "capture/SystemAudioTimelinePolicy.h"
 #include "media/AudioVideoMuxer.h"
 #include "media/CompressedTimelineAlignment.h"
 #include "media/MediaExporter.h"
@@ -9,10 +11,12 @@
 #include <filesystem>
 #include <iostream>
 #include <string_view>
+#include <thread>
 
 namespace {
 
 using qrec::media::CompressedTimelineAlignment;
+using namespace std::chrono_literals;
 
 int gFailures = 0;
 
@@ -132,6 +136,70 @@ void TestInvalidRangesAreRejected() {
         L"empty measured video must be rejected");
 }
 
+void TestPacketCadenceJitterDoesNotBecomeSilence() {
+    constexpr std::uint64_t encodedFrames = 35'872;
+    const qrec::capture::SystemAudioCatchUpPlan unguarded =
+        qrec::capture::PlanSystemAudioSilenceCatchUp(
+            1s,
+            encodedFrames,
+            48'000,
+            250ms,
+            0ns);
+    Expect(
+        unguarded.targetFrames == 36'000 &&
+            unguarded.silenceFrames == 128,
+        L"unguarded packet cadence should reproduce the 128-frame dropout");
+
+    const qrec::capture::SystemAudioCatchUpPlan guarded =
+        qrec::capture::PlanSystemAudioSilenceCatchUp(
+            1s,
+            encodedFrames,
+            48'000,
+            250ms,
+            200ms);
+    Expect(
+        guarded.targetFrames == 26'400,
+        L"guarded catch-up should retain a 200 ms late-packet window");
+    Expect(
+        guarded.silenceFrames == 0,
+        L"normal packet cadence jitter must not synthesize silence");
+}
+
+void TestConfirmedAudioOutageStillFillsTimeline() {
+    const qrec::capture::SystemAudioCatchUpPlan plan =
+        qrec::capture::PlanSystemAudioSilenceCatchUp(
+            1s,
+            12'000,
+            48'000,
+            250ms,
+            200ms);
+    Expect(
+        plan.targetFrames == 26'400,
+        L"confirmed outage should advance through the protected boundary");
+    Expect(
+        plan.silenceFrames == 14'400,
+        L"confirmed outage should synthesize only the old, unrecoverable gap");
+}
+
+void TestInvalidAudioCatchUpInputsAreSafe() {
+    Expect(
+        qrec::capture::PlanSystemAudioSilenceCatchUp(
+            -1ns,
+            0,
+            48'000,
+            250ms,
+            200ms).silenceFrames == 0,
+        L"negative active duration must not create silence");
+    Expect(
+        qrec::capture::PlanSystemAudioSilenceCatchUp(
+            1s,
+            0,
+            0,
+            250ms,
+            200ms).silenceFrames == 0,
+        L"zero sample rate must not create silence");
+}
+
 int RunUnitTests() {
     TestFailedProductionRangeNowAligns();
     TestMaterialTruncationStillFails();
@@ -139,10 +207,77 @@ int RunUnitTests() {
     TestThirtyFpsBoundaryQuantization();
     TestLongerVideoClampsToRequestedRange();
     TestInvalidRangesAreRejected();
+    TestPacketCadenceJitterDoesNotBecomeSilence();
+    TestConfirmedAudioOutageStillFillsTimeline();
+    TestInvalidAudioCatchUpInputsAreSafe();
     if (gFailures == 0) {
-        std::wcout << L"PASS: media timeline unit tests\n";
+        std::wcout <<
+            L"PASS: media timeline and system-audio policy unit tests\n";
     }
     return gFailures == 0 ? 0 : 1;
+}
+
+int RunLoopbackCapture(const int argumentCount, wchar_t* arguments[]) {
+    if (argumentCount != 4) {
+        std::wcerr <<
+            L"Usage: MediaTimelineTests --capture-loopback <output.m4a> "
+            L"<duration-ms>\n";
+        return 64;
+    }
+
+    const std::int64_t durationMilliseconds = _wtoi64(arguments[3]);
+    if (durationMilliseconds < 500 || durationMilliseconds > 120'000) {
+        std::wcerr << L"Capture duration must be between 500 and 120000 ms.\n";
+        return 64;
+    }
+
+    qrec::capture::SystemAudioCapture capture;
+    qrec::capture::SystemAudioCaptureError error;
+    const qrec::capture::SystemAudioCaptureConfig config{
+        std::filesystem::path(arguments[2]),
+        48'000,
+        2,
+        0,
+        qrec::capture::SystemAudioEndpointRole::Multimedia,
+    };
+    if (!capture.StartPrepared(config, {}, &error)) {
+        std::wcerr << L"captureStartError=" << error.message << L'\n';
+        return 4;
+    }
+
+    const std::optional<qrec::capture::SystemAudioQpcPosition> startQpc =
+        qrec::capture::QuerySystemAudioQpcPosition100Nanoseconds();
+    if (!capture.Resume(startQpc, &error)) {
+        std::wcerr << L"captureResumeError=" << error.message << L'\n';
+        return 5;
+    }
+
+    const std::chrono::milliseconds duration(durationMilliseconds);
+    std::this_thread::sleep_for(duration);
+    const std::optional<qrec::capture::SystemAudioQpcPosition> stopQpc =
+        qrec::capture::QuerySystemAudioQpcPosition100Nanoseconds();
+    const std::optional<qrec::capture::SystemAudioRecordingResult> result =
+        capture.Stop(
+            stopQpc,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(duration),
+            &error);
+    if (!result.has_value()) {
+        std::wcerr << L"captureStopError=" << error.message << L'\n';
+        return 6;
+    }
+
+    std::wcout
+        << L"captureSuccess=true"
+        << L" durationMs=" << result->duration.count()
+        << L" bitrate=" << result->averageBitrate
+        << L" encodedFrames=" << result->encodedFrames
+        << L" silentFrames=" << result->silentFrames
+        << L" syntheticSilentFrames=" << result->syntheticSilentFrames
+        << L" catchUpSilentFrames=" << result->catchUpSilentFrames
+        << L" catchUpEventCount=" << result->catchUpEventCount
+        << L" discontinuityCount=" << result->discontinuityCount
+        << L" output=" << result->outputPath.wstring() << L'\n';
+    return 0;
 }
 
 int RunMuxIntegration(const int argumentCount, wchar_t* arguments[]) {
@@ -243,6 +378,10 @@ int wmain(const int argumentCount, wchar_t* arguments[]) {
     if (argumentCount >= 2 &&
         std::wstring_view(arguments[1]) == L"--warm-cache") {
         return RunWarmCacheIntegration(argumentCount, arguments);
+    }
+    if (argumentCount >= 2 &&
+        std::wstring_view(arguments[1]) == L"--capture-loopback") {
+        return RunLoopbackCapture(argumentCount, arguments);
     }
     return RunUnitTests();
 }

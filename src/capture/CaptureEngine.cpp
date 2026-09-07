@@ -607,6 +607,20 @@ struct CaptureEngine::Impl final {
                 systemAudioRecording.sampleRate = audioResult->sampleRate;
                 systemAudioRecording.channels = audioResult->channelCount;
                 systemAudioRecording.duration = audioResult->duration;
+                systemAudioRecording.averageBitrate =
+                    audioResult->averageBitrate;
+                systemAudioRecording.encodedFrames =
+                    audioResult->encodedFrames;
+                systemAudioRecording.silentFrames =
+                    audioResult->silentFrames;
+                systemAudioRecording.syntheticSilentFrames =
+                    audioResult->syntheticSilentFrames;
+                systemAudioRecording.catchUpSilentFrames =
+                    audioResult->catchUpSilentFrames;
+                systemAudioRecording.catchUpEventCount =
+                    audioResult->catchUpEventCount;
+                systemAudioRecording.discontinuityCount =
+                    audioResult->discontinuityCount;
                 systemAudioRecording.statusMessage =
                     L"捕获系统正在播放的声音";
             } else {

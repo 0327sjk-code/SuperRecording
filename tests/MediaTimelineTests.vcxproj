@@ -41,15 +41,19 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;mfplat.lib;mf.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;ole32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;comctl32.lib;comdlg32.lib;dwmapi.lib;propsys.lib;strmiids.lib;uuid.lib;gdiplus.lib;gdi32.lib;user32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;mfplat.lib;mf.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;ole32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;comctl32.lib;comdlg32.lib;dwmapi.lib;propsys.lib;strmiids.lib;uuid.lib;mmdevapi.lib;avrt.lib;gdiplus.lib;gdi32.lib;user32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="MediaTimelineTests.cpp" />
+    <ClCompile Include="..\src\capture\SystemAudioCapture.cpp" />
+    <ClCompile Include="..\src\capture\SystemAudioTimelinePolicy.cpp" />
     <ClCompile Include="..\src\common\Win32Helpers.cpp" />
     <ClCompile Include="..\src\media\*.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\capture\SystemAudioCapture.h" />
+    <ClInclude Include="..\src\capture\SystemAudioTimelinePolicy.h" />
     <ClInclude Include="..\src\common\Win32Helpers.h" />
     <ClInclude Include="..\src\media\*.h" />
   </ItemGroup>

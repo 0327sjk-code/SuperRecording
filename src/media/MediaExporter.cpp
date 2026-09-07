@@ -2665,7 +2665,7 @@ MediaExportEstimate MediaExporter::EstimateOutput(
     constexpr long double kMillisecondsPerSecond = 1'000.0L;
     constexpr long double kMp4ContainerFactor = 1.015L;
     constexpr long double kCompressedPathFactor = 1.02L;
-    constexpr long double kStereoAacBitrate = 192'000.0L;
+    constexpr long double kStereoAacBitrate = 320'000.0L;
     constexpr long double kGifBytesPerPixelFrame = 0.22L;
     constexpr long double kGifFixedOverheadBytes = 4'096.0L;
     constexpr long double kMp4FixedOverheadBytes = 16'384.0L;

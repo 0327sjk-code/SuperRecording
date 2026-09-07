@@ -71,6 +71,9 @@ struct SystemAudioCaptureStats final {
     std::chrono::milliseconds activeDuration{};
     std::uint64_t encodedFrames{};
     std::uint64_t silentFrames{};
+    std::uint64_t syntheticSilentFrames{};
+    std::uint64_t catchUpSilentFrames{};
+    std::uint64_t catchUpEventCount{};
     std::uint64_t discardedFramesDuringPause{};
     std::uint64_t discontinuityCount{};
 };
@@ -83,6 +86,10 @@ struct SystemAudioRecordingResult final {
     std::uint32_t averageBitrate{};
     std::uint64_t encodedFrames{};
     std::uint64_t silentFrames{};
+    std::uint64_t syntheticSilentFrames{};
+    std::uint64_t catchUpSilentFrames{};
+    std::uint64_t catchUpEventCount{};
+    std::uint64_t discontinuityCount{};
 };
 
 struct SystemAudioCaptureCallbacks final {
