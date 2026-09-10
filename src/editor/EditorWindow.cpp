@@ -1340,12 +1340,6 @@ private:
         if (notificationCode != BN_CLICKED) {
             return;
         }
-        const HWND control = ::GetDlgItem(window_, id);
-        if (control != nullptr) {
-            // Commands are deferred below; let the normal 16 ms motion cadence
-            // coalesce press/release painting instead of blocking input on GDI.
-            ::InvalidateRect(control, nullptr, FALSE);
-        }
         if (::PostMessageW(
                 window_,
                 kDeferredEditorCommandMessage,

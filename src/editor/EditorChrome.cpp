@@ -33,10 +33,87 @@ constexpr auto kPressExitDuration = std::chrono::milliseconds(140);
 constexpr auto kFocusEnterDuration = std::chrono::milliseconds(180);
 constexpr auto kFocusExitDuration = std::chrono::milliseconds(120);
 
+class ButtonBackBuffer final {
+public:
+    ButtonBackBuffer() = default;
+    ButtonBackBuffer(const ButtonBackBuffer&) = delete;
+    ButtonBackBuffer& operator=(const ButtonBackBuffer&) = delete;
+
+    ~ButtonBackBuffer() {
+        Reset();
+    }
+
+    [[nodiscard]] HDC Ensure(
+        const HDC target,
+        const int width,
+        const int height) noexcept {
+        if (target == nullptr || width <= 0 || height <= 0) {
+            return nullptr;
+        }
+
+        if (device_ == nullptr) {
+            device_ = ::CreateCompatibleDC(target);
+            if (device_ == nullptr) {
+                return nullptr;
+            }
+        }
+
+        if (bitmap_ != nullptr && width_ == width && height_ == height) {
+            return device_;
+        }
+
+        const HBITMAP replacement = ::CreateCompatibleBitmap(target, width, height);
+        if (replacement == nullptr) {
+            return nullptr;
+        }
+        const HGDIOBJ displaced = ::SelectObject(device_, replacement);
+        if (displaced == nullptr || displaced == HGDI_ERROR) {
+            ::DeleteObject(replacement);
+            return nullptr;
+        }
+
+        if (bitmap_ == nullptr) {
+            previousBitmap_ = displaced;
+        } else {
+            ::DeleteObject(bitmap_);
+        }
+        bitmap_ = replacement;
+        width_ = width;
+        height_ = height;
+        return device_;
+    }
+
+    void Reset() noexcept {
+        if (device_ != nullptr && previousBitmap_ != nullptr &&
+            previousBitmap_ != HGDI_ERROR) {
+            ::SelectObject(device_, previousBitmap_);
+        }
+        if (bitmap_ != nullptr) {
+            ::DeleteObject(bitmap_);
+        }
+        if (device_ != nullptr) {
+            ::DeleteDC(device_);
+        }
+        device_ = nullptr;
+        bitmap_ = nullptr;
+        previousBitmap_ = nullptr;
+        width_ = 0;
+        height_ = 0;
+    }
+
+private:
+    HDC device_{};
+    HBITMAP bitmap_{};
+    HGDIOBJ previousBitmap_{};
+    int width_{};
+    int height_{};
+};
+
 struct ButtonMotionState final {
     ui::MotionState hover{};
     ui::MotionState press{};
     ui::MotionState focus{};
+    ButtonBackBuffer backBuffer{};
     std::wstring cachedLabel;
     SIZE cachedLabelSize{};
     HFONT cachedLabelFont{};
@@ -127,6 +204,22 @@ void UpdateButtonMotionTimer(const HWND control, ButtonMotionState& state) noexc
         ::KillTimer(control, kButtonMotionTimerId);
         state.timerArmed = false;
     }
+}
+
+void SetButtonPressTarget(
+    const HWND control,
+    ButtonMotionState& state,
+    const bool active) noexcept {
+    const bool changed = state.press.SetTarget(
+        active ? 1.0F : 0.0F,
+        active ? kPressEnterDuration : kPressExitDuration,
+        ui::MotionEasing::EaseOutQuart,
+        ui::ClientAreaAnimationsEnabled());
+    if (!changed) {
+        return;
+    }
+    UpdateButtonMotionTimer(control, state);
+    RequestButtonRedraw(control);
 }
 
 int ScaleForWindow(const HWND window, const int value) noexcept {
@@ -637,38 +730,26 @@ LRESULT CALLBACK EditorChrome::ButtonSubclassProc(
             }
             break;
         case WM_LBUTTONDOWN:
-            // Press state is committed to the next coalesced paint frame; input
-            // remains non-blocking even if DWM/GDI is temporarily saturated.
-            state->press.JumpTo(1.0F);
-            UpdateButtonMotionTimer(control, *state);
-            RequestButtonRedraw(control);
+            SetButtonPressTarget(control, *state, true);
             break;
         case WM_LBUTTONUP:
         case WM_CAPTURECHANGED:
         case WM_CANCELMODE:
-            state->press.JumpTo(0.0F);
-            UpdateButtonMotionTimer(control, *state);
-            RequestButtonRedraw(control);
+            SetButtonPressTarget(control, *state, false);
             break;
         case WM_KEYDOWN:
             if (wParam == VK_SPACE &&
                 (static_cast<LPARAM>(lParam) & (1LL << 30)) == 0) {
-                state->press.JumpTo(1.0F);
-                UpdateButtonMotionTimer(control, *state);
-                RequestButtonRedraw(control);
+                SetButtonPressTarget(control, *state, true);
             }
             break;
         case WM_KEYUP:
             if (wParam == VK_SPACE) {
-                state->press.JumpTo(0.0F);
-                UpdateButtonMotionTimer(control, *state);
-                RequestButtonRedraw(control);
+                SetButtonPressTarget(control, *state, false);
             }
             break;
         case BM_SETSTATE:
-            state->press.JumpTo(wParam != FALSE ? 1.0F : 0.0F);
-            UpdateButtonMotionTimer(control, *state);
-            RequestButtonRedraw(control);
+            SetButtonPressTarget(control, *state, wParam != FALSE);
             break;
         case WM_SETFOCUS:
             SetMotionTarget(
@@ -722,7 +803,12 @@ LRESULT CALLBACK EditorChrome::ButtonSubclassProc(
         case WM_SETFONT:
         case WM_DPICHANGED_AFTERPARENT:
             state->labelMetricsValid = false;
+            if (message == WM_DPICHANGED_AFTERPARENT) {
+                state->backBuffer.Reset();
+            }
             break;
+        case WM_ERASEBKGND:
+            return 1;
         case WM_NCDESTROY:
             ::KillTimer(control, kButtonMotionTimerId);
             state->timerArmed = false;
@@ -1130,8 +1216,28 @@ bool EditorChrome::DrawButton(
         : (focused ? 1.0F : 0.0F);
     const float selectionAmount = state.selected ? 1.0F : 0.0F;
 
-    const HDC dc = item->hDC;
-    RECT bounds = item->rcItem;
+    const HDC target = item->hDC;
+    const RECT targetBounds = item->rcItem;
+    const int targetWidth = std::max(
+        0,
+        static_cast<int>(targetBounds.right - targetBounds.left));
+    const int targetHeight = std::max(
+        0,
+        static_cast<int>(targetBounds.bottom - targetBounds.top));
+    HDC dc = target;
+    RECT bounds = targetBounds;
+    bool usingBackBuffer = false;
+    if (motion != nullptr) {
+        const HDC buffer = motion->backBuffer.Ensure(
+            target,
+            targetWidth,
+            targetHeight);
+        if (buffer != nullptr) {
+            dc = buffer;
+            bounds = RECT{0, 0, targetWidth, targetHeight};
+            usingBackBuffer = true;
+        }
+    }
     FillSolidRectangle(dc, bounds, editor_theme::Panel);
     RECT shape = bounds;
     ::InflateRect(&shape, -scale(1), -scale(1));
@@ -1452,6 +1558,18 @@ bool EditorChrome::DrawButton(
         }
     }
     ::SelectObject(dc, previousFont);
+    if (usingBackBuffer && targetWidth > 0 && targetHeight > 0) {
+        static_cast<void>(::BitBlt(
+            target,
+            targetBounds.left,
+            targetBounds.top,
+            targetWidth,
+            targetHeight,
+            dc,
+            0,
+            0,
+            SRCCOPY));
+    }
     return true;
 }
 
