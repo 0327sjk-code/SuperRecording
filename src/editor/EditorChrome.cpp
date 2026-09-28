@@ -1,4 +1,6 @@
 #include "editor/EditorChrome.h"
+#include "editor/AnnotationTimeline.h"
+#include "editor/AnnotationIcons.h"
 
 #include "editor/EditorAudioToggle.h"
 #include "editor/EditorSpeedControl.h"
@@ -831,11 +833,13 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const bool compact = width < Scale(window, 970);
     const int margin = Scale(window, 28);
     const int headerHeight = Scale(window, kHeaderHeight);
-    const int panelHeight = Scale(window, compact ? 316 : 224);
+    const int annotationTrackHeight = Scale(window, AnnotationTimeline::HeightDip);
+    const int panelHeight = Scale(window, compact ? 316 : 224) + annotationTrackHeight;
     const int previewGap = Scale(window, 16);
-    const int previewTop = headerHeight + Scale(window, 16);
+    const int toolsTop = headerHeight + Scale(window, 12);
+    const int previewTop = toolsTop;
     layout.editorPanelTop = std::max(
-        previewTop + Scale(window, 190),
+        previewTop + Scale(window, 166),
         height - panelHeight);
 
     SetRect(
@@ -851,13 +855,15 @@ EditorChromeLayout EditorChrome::CalculateLayout(
         width - margin * 2,
         Scale(window, 20));
 
-    const int previewAreaWidth = std::max(1, width - margin * 2);
+    const int railWidth = Scale(window, 84);
+    const int previewLeft = margin + railWidth + Scale(window, 12);
+    const int previewAreaWidth = std::max(1, width - margin - previewLeft);
     const int previewAreaHeight = std::max(
         Scale(window, 150),
         layout.editorPanelTop - previewTop - previewGap);
     SetRect(
         layout.previewStage,
-        margin,
+        previewLeft,
         previewTop,
         previewAreaWidth,
         previewAreaHeight);
@@ -875,11 +881,13 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     }
     SetRect(
         layout.preview,
-        (width - previewWidth) / 2,
+        previewLeft + (previewAreaWidth - previewWidth) / 2,
         previewTop + (previewAreaHeight - previewHeight) / 2,
         previewWidth,
         previewHeight);
     layout.previewRadius = Scale(window, 4);
+    SetRect(layout.annotationTools, margin, toolsTop, railWidth,
+        previewTop + previewAreaHeight - toolsTop);
 
     const int contentWidth = std::max(1, width - margin * 2);
     const int rangeY = layout.editorPanelTop + Scale(window, 16);
@@ -941,17 +949,19 @@ EditorChromeLayout EditorChrome::CalculateLayout(
         Scale(window, EditorSpeedControl::HeightDip));
     SetRect(
         layout.rangeLabel,
-        margin,
+        previewLeft,
         rangeY,
         std::max(
             1,
             (compact
                 ? static_cast<int>(layout.trimStartButton.left)
                 : static_cast<int>(layout.qualityControl.left)) -
-                margin - Scale(window, 12)),
+                previewLeft - Scale(window, 12)),
         Scale(window, 30));
-    const int timelineY = secondaryToolY + Scale(window, 30);
-    SetRect(layout.timeline, margin, timelineY, contentWidth, Scale(window, 78));
+    const int annotationTrackY = secondaryToolY + Scale(window, 30);
+    const int timelineY = annotationTrackY + annotationTrackHeight;
+    SetRect(layout.annotationTrack, previewLeft, annotationTrackY, previewAreaWidth, annotationTrackHeight);
+    SetRect(layout.timeline, previewLeft, timelineY, previewAreaWidth, Scale(window, 78));
 
     const int buttonHeight = Scale(window, theme::ControlHeight);
     const int gap = Scale(window, 8);
@@ -962,6 +972,7 @@ EditorChromeLayout EditorChrome::CalculateLayout(
     const int saveWidth = Scale(window, 144);
     const int copyWidth = Scale(window, 150);
     const int firstRowY = timelineY + Scale(window, 90);
+    layout.annotationTools.bottom = firstRowY - Scale(window, 12);
     SetRect(layout.playButton, margin, firstRowY, playWidth, buttonHeight);
     SetRect(
         layout.timeLabel,
@@ -1173,6 +1184,8 @@ bool EditorChrome::DrawButton(
     const bool isTrimBoundary =
         state.role == EditorButtonRole::TrimStart ||
         state.role == EditorButtonRole::TrimEnd;
+    const bool isAnnotation = state.role >= EditorButtonRole::AnnotationSelect;
+    const bool selectable = isSegment || isAnnotation;
     const bool isPrimary = state.role == EditorButtonRole::Primary;
     const bool isPlay = state.role == EditorButtonRole::Play;
     const bool isCopy = state.role == EditorButtonRole::Secondary;
@@ -1268,19 +1281,19 @@ bool EditorChrome::DrawButton(
         border = fill;
         textColor = editor_theme::White;
     } else {
-        const COLORREF baseFill = isSegment
+        const COLORREF baseFill = selectable
             ? ui::InterpolateColor(
                 editor_theme::Control,
                 segmentSelectedFill,
                 selectionAmount)
             : editor_theme::Control;
-        const COLORREF hoverFill = isSegment
+        const COLORREF hoverFill = selectable
             ? ui::InterpolateColor(
                 editor_theme::ControlHover,
                 segmentSelectedHover,
                 selectionAmount)
             : editor_theme::ControlHover;
-        const COLORREF pressedFill = isSegment
+        const COLORREF pressedFill = selectable
             ? ui::InterpolateColor(
                 editor_theme::ControlPressed,
                 segmentSelectedPressed,
@@ -1292,7 +1305,7 @@ bool EditorChrome::DrawButton(
             editor_theme::Border,
             editor_theme::BorderHover,
             hoverAmount);
-        if (isSegment) {
+        if (selectable) {
             border = ui::InterpolateColor(
                 border,
                 segmentSelectedBorder,
@@ -1402,9 +1415,10 @@ bool EditorChrome::DrawButton(
             &labelSize));
     }
 
-    const bool hasIcon = isPlay || isCopy || isPrimary;
-    const int iconWidth = hasIcon ? scale(16) : 0;
-    const int iconGap = hasIcon ? scale(8) : 0;
+    if (isAnnotation) { labelText = L""; labelLength = 0; labelSize = {}; }
+    const bool hasIcon = isPlay || isCopy || isPrimary || isAnnotation;
+    const int iconWidth = hasIcon ? scale(isAnnotation ? 20 : 16) : 0;
+    const int iconGap = hasIcon && !isAnnotation ? scale(8) : 0;
     const int contentWidth = iconWidth + iconGap + labelSize.cx;
     const int contentLeft = bounds.left +
         (static_cast<int>(bounds.right - bounds.left) - contentWidth) / 2;
@@ -1413,7 +1427,12 @@ bool EditorChrome::DrawButton(
     if (hasIcon) {
         ui::Canvas iconCanvas(dc);
         const int iconLeft = contentLeft;
-        if (isPlay) {
+        if (isAnnotation) {
+            DrawAnnotationIcon(dc,
+                RECT{iconLeft, centerY-scale(10), iconLeft+scale(20), centerY+scale(10)},
+                state.role,
+                state.role == EditorButtonRole::AnnotationColor && enabled ? state.iconColor : textColor);
+        } else if (isPlay) {
             if (state.playing) {
                 RECT leftBar{
                     iconLeft + scale(2), centerY - scale(7),

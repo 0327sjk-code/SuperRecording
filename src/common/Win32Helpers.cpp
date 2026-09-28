@@ -7,6 +7,7 @@
 #include <shlobj.h>
 
 #include <array>
+#include <exception>
 #include <format>
 #include <system_error>
 
@@ -54,6 +55,17 @@ std::wstring FormatLastError(const DWORD error) {
 }
 
 std::filesystem::path LocalAppDataDirectory() {
+#ifdef SUPERRECORDING_ISOLATED_TESTS
+    // Test executables must never maintain the installed application's caches.
+    std::array<wchar_t, 32'768> testDirectory{};
+    const DWORD testLength = ::GetEnvironmentVariableW(
+        L"SUPERRECORDING_TEST_DATA_ROOT", testDirectory.data(),
+        static_cast<DWORD>(testDirectory.size()));
+    if (testLength > 0 && testLength < testDirectory.size()) {
+        return std::filesystem::path(testDirectory.data()) / product::LocalDataDirectoryName;
+    }
+    std::terminate();
+#else
     std::filesystem::path base = KnownFolder(FOLDERID_LocalAppData);
     if (base.empty()) {
         std::array<wchar_t, MAX_PATH> buffer{};
@@ -66,6 +78,7 @@ std::filesystem::path LocalAppDataDirectory() {
         }
     }
     return base / product::LocalDataDirectoryName;
+#endif
 }
 
 std::filesystem::path LegacyLocalAppDataDirectory() {

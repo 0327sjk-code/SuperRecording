@@ -79,6 +79,7 @@ private:
 }  // namespace
 
 RegionSelector::~RegionSelector() {
+    inputSurface_.Reset();
     if (window_ != nullptr) {
         DestroyWindow(window_);
         window_ = nullptr;
@@ -145,6 +146,7 @@ std::optional<IntRect> RegionSelector::Select(
         DestroyWindow(window_);
         window_ = nullptr;
     }
+    inputSurface_.Reset();
     frameBuffer_.Reset();
     owner_ = nullptr;
 
@@ -203,6 +205,11 @@ bool RegionSelector::CreateSelectionWindow(HWND owner) {
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
     SetWindowDisplayAffinity(window_, WDA_EXCLUDEFROMCAPTURE);
+    if (adjustSelectionBeforeRecording_ && !inputSurface_.Create(window_)) {
+        DestroyWindow(window_);
+        window_ = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -222,6 +229,7 @@ void RegionSelector::Complete(const IntRect& region) {
     // capture pipeline. Hiding it here also makes that ordering explicit to
     // the compositor on machines where window destruction is deferred.
     if (adjustSelectionBeforeRecording_ && window_ != nullptr) {
+        inputSurface_.Update(selection_, false);
         ShowWindow(window_, SW_HIDE);
     }
     result_ = encodedRegion;
@@ -976,6 +984,10 @@ void RegionSelector::Paint() {
         DpiAt(activeScreenPoint),
         state,
         frameBuffer_);
+    // The color-key hole is visually transparent AND input-transparent to
+    // Windows. Cover only that hole with an alpha=1 input surface; route all
+    // gestures through the existing edge/control/interior hit-test priorities.
+    inputSurface_.Update(selection_, state.adjusting);
 }
 
 LRESULT CALLBACK RegionSelector::WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {

@@ -7,6 +7,7 @@
 
 #include "../common/Types.h"
 #include "RegionSelectorView.h"
+#include "SelectionInputSurface.h"
 
 namespace qrec::selection {
 
@@ -102,6 +103,7 @@ private:
     bool completed_{};
     std::optional<IntRect> result_;
     view::FrameBuffer frameBuffer_;
+    SelectionInputSurface inputSurface_;
 };
 
 }  // namespace qrec::selection

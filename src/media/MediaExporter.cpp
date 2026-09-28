@@ -5,6 +5,9 @@
 #include "common/Win32Helpers.h"
 #include "media/AacAudioWriter.h"
 #include "media/BgraFrameScaler.h"
+#include "annotations/AnnotationRenderer.h"
+#include "annotations/AnnotationCompositor.h"
+#include "media/AnnotatedMp4.h"
 #include "media/ExportQuality.h"
 #include "media/Mp4BoundaryTrimmer.h"
 #include "media/Mp4Writer.h"
@@ -208,7 +211,9 @@ std::wstring LowercaseExtension(const std::filesystem::path& path) {
 }
 
 bool IsWholeRangeMp4(const ExportRequest& request) noexcept {
-    if (request.qualityPercent != media::ExportQuality::DefaultPercent ||
+    if (annotations::HasVisibleMarks(request.annotations, request.trimStart,
+            request.trimEnd > request.trimStart ? request.trimEnd : request.recording.duration) ||
+        request.qualityPercent != media::ExportQuality::DefaultPercent ||
         request.playbackSpeedTenths != kNormalPlaybackSpeedTenths ||
         request.format != OutputFormat::Mp4 ||
         request.recording.sourcePath.empty() ||
@@ -1357,6 +1362,7 @@ HRESULT ExportMp4(
     std::vector<std::uint8_t> pixels;
     std::vector<std::uint8_t> scaledPixels;
     LONGLONG lastOutputTimestamp = -1;
+    annotations::FrameCompositor annotationCompositor(request.annotations);
 
     for (;;) {
         if (stopToken.stop_requested()) {
@@ -1403,7 +1409,7 @@ HRESULT ExportMp4(
             }
             return result;
         }
-        const std::vector<std::uint8_t>* writerPixels = &pixels;
+        std::vector<std::uint8_t>* writerPixels = &pixels;
         if (scalingRequired) {
             result = frameScaler.Scale(
                 pixels,
@@ -1420,6 +1426,12 @@ HRESULT ExportMp4(
                 return result;
             }
             writerPixels = &scaledPixels;
+        }
+        if (!annotationCompositor.Apply(*writerPixels, outputSize.width, outputSize.height,
+                outputSize.width * 4U,
+                std::chrono::milliseconds(frame.timestamp / 10'000))) {
+            if (errorMessage != nullptr) *errorMessage = L"无法合成视频标注。";
+            return E_FAIL;
         }
         if (!writer.WriteBgraFrame(
                 *writerPixels,
@@ -1789,6 +1801,7 @@ HRESULT ExportGif(
     LONGLONG nextFrameTime = trimStart;
     std::uint64_t writtenFrames = 0;
     std::vector<std::uint8_t> pixels;
+    annotations::FrameCompositor annotationCompositor(request.annotations);
 
     ReportProgress(
         progress,
@@ -1815,6 +1828,12 @@ HRESULT ExportGif(
             continue;
         }
         result = ExtractTopDownBgra(frame.sample.Get(), source, &pixels);
+        if (SUCCEEDED(result) && !annotationCompositor.Apply(pixels, source.width, source.height,
+                source.width * 4U,
+                std::chrono::milliseconds(frame.timestamp / 10'000))) {
+            if (errorMessage != nullptr) *errorMessage = L"无法合成 GIF 标注。";
+            return E_FAIL;
+        }
         if (SUCCEEDED(result)) {
             // GIF 延迟单位是 1/100 秒；用误差扩散交替 6/7 等延迟，避免 15 FPS
             // 全部取 7 导致长片段逐渐变慢。
@@ -2131,6 +2150,65 @@ MediaExportResult PrepareCachedArtifact(
                         progress,
                         generationStopToken,
                         generationError);
+                }
+
+                if (annotations::HasVisibleMarks(request.annotations,
+                        request.trimStart, request.trimEnd)) {
+                    // Spatial quality is prepared once for the whole recording;
+                    // subsequent annotation edits only rebuild affected GOPs.
+                    if (request.qualityPercent != media::ExportQuality::DefaultPercent ||
+                        request.playbackSpeedTenths != kNormalPlaybackSpeedTenths) {
+                        ExportRequest normalized = request;
+                        normalized.playbackSpeedTenths = kNormalPlaybackSpeedTenths;
+                        if (request.qualityPercent != media::ExportQuality::DefaultPercent) {
+                            ExportRequest base = request;
+                            base.annotations.reset();
+                            base.trimStart = std::chrono::milliseconds::zero();
+                            base.trimEnd = request.recording.duration;
+                            base.playbackSpeedTenths = kNormalPlaybackSpeedTenths;
+                            const auto preparedBase = PrepareCachedArtifact(base, progress, generationStopToken);
+                            if (!preparedBase.success) {
+                                if (generationError) *generationError = preparedBase.errorMessage;
+                                return preparedBase.nativeError;
+                            }
+                            const auto size = media::ExportQuality::ComputeMp4Size(
+                                request.recording.width, request.recording.height, request.qualityPercent);
+                            normalized.recording.sourcePath = preparedBase.outputPath;
+                            normalized.recording.width = size.width;
+                            normalized.recording.height = size.height;
+                            normalized.qualityPercent = media::ExportQuality::DefaultPercent;
+                        }
+                        const auto annotated = PrepareCachedArtifact(normalized, progress, generationStopToken);
+                        if (!annotated.success) {
+                            if (generationError) *generationError = annotated.errorMessage;
+                            return annotated.nativeError;
+                        }
+                        generationDiagnostic = L"generator=AnnotationPrepared; " + annotated.diagnosticSummary;
+                        generatedDisposition = MediaExportDisposition::BoundaryTrimmedHybrid;
+                        if (request.playbackSpeedTenths != kNormalPlaybackSpeedTenths) {
+                            const auto retimed = AudioVideoMuxer::RetimeCompressedVideo(
+                                {annotated.outputPath, stagingPath, request.playbackSpeedTenths},generationStopToken);
+                            if (retimed.outcome == AudioVideoMuxOutcome::Succeeded) return S_OK;
+                            if (generationError) *generationError = retimed.errorMessage;
+                            return retimed.nativeError;
+                        }
+                        MediaArtifactDelivery delivery{};
+                        return ExportArtifactCache::Materialize(annotated.outputPath,stagingPath,generationStopToken,&delivery);
+                    }
+                    const auto hybrid = ExportAnnotatedMp4(request, stagingPath, generationStopToken, progress);
+                    generationDiagnostic = std::format(
+                        L"generator=AnnotationHybrid; encodedFrames={}; copiedSamples={}; cachedSegments={}; encodedSegments={}; reason={}",
+                        hybrid.encodedFrames,hybrid.copiedSamples,hybrid.cachedSegments,hybrid.encodedSegments,hybrid.error);
+                    if (hybrid.outcome == Mp4BoundaryTrimOutcome::Succeeded) {
+                        generatedDisposition = MediaExportDisposition::BoundaryTrimmedHybrid;
+                        return S_OK;
+                    }
+                    if (hybrid.outcome == Mp4BoundaryTrimOutcome::Cancelled) return hybrid.nativeError;
+                    // Strict codec/timestamp compatibility gates always win over speed.
+                    generatedDisposition = MediaExportDisposition::Transcoded;
+                    generationDiagnostic += L"; fallback=AnnotationTranscode";
+                    return ExportMp4(request, stagingPath, progress,
+                        generationStopToken, generationError);
                 }
 
                 if (request.qualityPercent <

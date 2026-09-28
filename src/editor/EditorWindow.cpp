@@ -4,10 +4,12 @@
 #include "common/Win32Helpers.h"
 #include "editor/EditorAudioToggle.h"
 #include "editor/EditorChrome.h"
+#include "editor/EditorAnnotations.h"
 #include "editor/EditorSpeedControl.h"
 #include "editor/EditorTheme.h"
 #include "editor/EditorTimeFormat.h"
 #include "editor/MediaPreview.h"
+#include "editor/PreviewSurface.h"
 #include "editor/PreparedExportArtifact.h"
 #include "editor/TrimTimeline.h"
 #include "editor/WarmCacheCoordinator.h"
@@ -41,6 +43,8 @@ namespace qrec {
 namespace {
 
 constexpr wchar_t kEditorWindowClassName[] = L"SuperRecording.EditorWindow";
+constexpr int kInitialEditorWidthDip = 1500;
+constexpr int kInitialEditorHeightDip = 1000;
 constexpr UINT_PTR kPlaybackTimer = 1;
 constexpr UINT_PTR kTimelineSeekTimer = 2;
 constexpr UINT_PTR kWarmCacheDebounceTimer = 3;
@@ -63,7 +67,6 @@ constexpr UINT kExportCompletedMessage = WM_APP + 0x232;
 constexpr UINT kWarmCacheProgressMessage = WM_APP + 0x233;
 constexpr UINT kWarmCacheCompletedMessage = WM_APP + 0x234;
 constexpr UINT kDeferredEditorCommandMessage = WM_APP + 0x23A;
-constexpr UINT kRefreshPreviewVideoMessage = WM_APP + 0x23B;
 constexpr UINT kPreviewProxyCompletedMessage = WM_APP + 0x23C;
 
 constexpr int kPreviewId = 1001;
@@ -328,7 +331,7 @@ public:
         lastExportProgressSignalMilliseconds_.store(0, std::memory_order_release);
 
         const UINT dpi = owner_ != nullptr ? ::GetDpiForWindow(owner_) : USER_DEFAULT_SCREEN_DPI;
-        RECT rectangle{0, 0, ScaleForDpi(1040, dpi), ScaleForDpi(720, dpi)};
+        RECT rectangle{0, 0, ScaleForDpi(kInitialEditorWidthDip, dpi), ScaleForDpi(kInitialEditorHeightDip, dpi)};
         ::AdjustWindowRectExForDpi(
             &rectangle,
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -407,6 +410,8 @@ public:
     [[nodiscard]] bool IsOpen() const noexcept {
         return window_ != nullptr && ::IsWindow(window_) != FALSE;
     }
+
+    bool HandleAnnotationKey(const MSG& message) { return annotations_.HandleKey(message); }
 
 private:
     [[nodiscard]] bool HasPreparedCaptureVideoForCurrentQuality() const noexcept {
@@ -574,11 +579,7 @@ private:
             LayoutControls(LOWORD(lParam), HIWORD(lParam));
             return 0;
         case WM_EXITSIZEMOVE:
-            previewVideoRefreshPosted_ = false;
-            warmCacheProgressMessagePending_.store(false, std::memory_order_release);
-            warmCacheCompletionMessagePending_.store(false, std::memory_order_release);
-            exportProgressMessagePending_.store(false, std::memory_order_release);
-            preview_.UpdateVideo();
+            ::InvalidateRect(previewHost_, nullptr, FALSE);
             return 0;
         case WM_PAINT:
             chrome_.PaintWindow(
@@ -593,7 +594,7 @@ private:
                 0,
                 0,
                 ScaleForDpi(760, dpi),
-                ScaleForDpi(590, dpi)};
+                ScaleForDpi(640, dpi)};
             const DWORD style = static_cast<DWORD>(::GetWindowLongPtrW(window_, GWL_STYLE));
             const DWORD extendedStyle =
                 static_cast<DWORD>(::GetWindowLongPtrW(window_, GWL_EXSTYLE));
@@ -692,10 +693,6 @@ private:
         case kDeferredEditorCommandMessage:
             ExecuteCommand(static_cast<int>(wParam));
             return 0;
-        case kRefreshPreviewVideoMessage:
-            previewVideoRefreshPosted_ = false;
-            preview_.UpdateVideo();
-            return 0;
         case kExportProgressMessage:
             HandleExportProgress();
             return 0;
@@ -723,6 +720,7 @@ private:
                 return 0;
             }
             break;
+        case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC: {
             const HDC dc = reinterpret_cast<HDC>(wParam);
             const HWND control = reinterpret_cast<HWND>(lParam);
@@ -769,6 +767,7 @@ private:
             ::DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
+            annotations_.Destroy();
             WriteInteractionMetrics();
             DiscardBoundaryEncoderPreparation();
             notificationTarget_.store(nullptr, std::memory_order_release);
@@ -784,7 +783,6 @@ private:
             previewSeekInFlight_ = false;
             inFlightTimelineSeek_.reset();
             playAfterTimelineSeek_ = false;
-            previewVideoRefreshPosted_ = false;
             mediaItemReady_ = false;
             StopWarmCacheAndWait();
             StopPreviewProxyAndWait();
@@ -815,10 +813,7 @@ private:
             return false;
         }
 
-        previewHost_ = ::CreateWindowExW(
-            0, WC_STATICW, L"", WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
-            0, 0, 1, 1, window_,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPreviewId)), instance_, nullptr);
+        previewHost_ = previewSurface_.Create(window_, instance_, kPreviewId, &preview_);
         headerTitle_ = CreateStatic(L"裁剪与导出", kHeaderTitleId, SS_LEFT | SS_CENTERIMAGE);
         headerSubtitle_ = CreateStatic(L"正在读取录屏信息…", kHeaderSubtitleId, SS_LEFT | SS_CENTERIMAGE);
         rangeText_ = CreateStatic(
@@ -885,6 +880,31 @@ private:
         if (std::ranges::any_of(controls, [](const HWND control) { return control == nullptr; })) {
             return false;
         }
+
+        EditorAnnotationCallbacks annotationCallbacks;
+        annotationCallbacks.pauseAndPosition = [this] {
+            playAfterTimelineSeek_ = false;
+            awaitingNaturalPlaybackEnd_ = false;
+            if (playing_) {
+                static_cast<void>(preview_.Pause());
+                playing_ = false;
+                StopPlaybackUiTimer();
+                timeline_.SetPlayhead(preview_.Position());
+                UpdateTimeLabels(timeline_.Playhead());
+                UpdatePlayButton();
+            }
+            return timeline_.Playhead();
+        };
+        annotationCallbacks.changed = [this] {
+            ScheduleWarmCache(100);
+            UpdateOutputSizeEstimate();
+        };
+        annotationCallbacks.error = [this](const std::wstring& error) {
+            SetStatus(error, EditorStatusTone::Error);
+        };
+        if (!annotations_.Create(window_, instance_, &chrome_,
+                {static_cast<float>(recording_.width), static_cast<float>(recording_.height)},
+                duration_, std::move(annotationCallbacks))) return false;
 
         InitializeTooltips();
 
@@ -1247,17 +1267,14 @@ private:
         previewStage_ = layout.previewStage;
         statusDotCenter_ = layout.statusDotCenter;
         chrome_.ApplyPreviewRegion(previewHost_, layout);
+        annotations_.Layout(layout);
         ::RedrawWindow(
             window_,
             nullptr,
             nullptr,
             RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
-        // Coalesce resize bursts. EVR composition is refreshed after the current
-        // input/layout batch instead of synchronously blocking every WM_SIZE.
-        if (!previewVideoRefreshPosted_) {
-            previewVideoRefreshPosted_ = ::PostMessageW(
-                window_, kRefreshPreviewVideoMessage, 0, 0) != FALSE;
-        }
+        // The video child repaints its retained frame in WM_PAINT after this
+        // layout batch. No static background paint can overwrite that frame.
     }
 
     void SetStatus(const std::wstring& text, const EditorStatusTone tone) {
@@ -1350,6 +1367,7 @@ private:
     }
 
     void ExecuteCommand(const int id) {
+        annotations_.CommitText();
         switch (id) {
         case kPlayButtonId:
             TogglePlayback();
@@ -1704,6 +1722,8 @@ private:
             position,
             std::chrono::milliseconds::zero(),
             duration_);
+        annotations_.CommitText();
+        annotations_.SetPosition(clamped);
         awaitingNaturalPlaybackEnd_ = false;
         ++previewSeekRequestCount_;
         if (pendingTimelineSeek_.has_value() || previewSeekInFlight_) {
@@ -1787,6 +1807,7 @@ private:
     }
 
     void TogglePlayback() {
+        annotations_.CommitText();
         if (exporter_.IsRunning()) {
             return;
         }
@@ -1901,6 +1922,7 @@ private:
     }
 
     void UpdatePlayButton() {
+        annotations_.SetPosition(timeline_.Playhead(), playing_);
         if (playButton_ != nullptr) {
             const std::wstring label = playing_ ? L"暂停" : L"播放";
             if (displayedPlayButtonText_ != label) {
@@ -1931,6 +1953,7 @@ private:
             return;
         }
         const auto position = preview_.Position();
+        annotations_.SetPosition(position, true);
         const auto endGuard = PlaybackEndGuard();
         const auto guardedEnd = std::max(trimStart_, trimEnd_ - endGuard);
         if (position >= guardedEnd) {
@@ -1956,6 +1979,7 @@ private:
     }
 
     void UpdateTimeLabels(const std::chrono::milliseconds position) {
+        annotations_.SetPosition(position, playing_);
         const auto positionBucket = std::chrono::milliseconds(
             std::max<std::int64_t>(0, position.count()) / 10 * 10);
         if (positionBucket != lastTimeLabelPositionBucket_ ||
@@ -2077,7 +2101,8 @@ private:
         if (selectedFormat_ == OutputFormat::Mp4 && !trimRangeEdited_ &&
             !ShouldIncludeSystemAudio() &&
             playbackSpeedTenths_ == EditorSpeedControl::DefaultSpeedTenths &&
-            HasPreparedCaptureVideoForCurrentQuality()) {
+            HasPreparedCaptureVideoForCurrentQuality() &&
+            !annotations::HasVisibleMarks(annotations_.Snapshot(), trimStart_, trimEnd_)) {
             SetStatus(
                 std::format(
                     L"{}% 画质成片已随录制完成；复制或保存将立即完成",
@@ -2085,7 +2110,9 @@ private:
                 EditorStatusTone::Success);
             return;
         }
-        if (selectedFormat_ == OutputFormat::Gif) {
+        if (annotations::HasVisibleMarks(annotations_.Snapshot(), trimStart_, trimEnd_)) {
+            SetStatus(L"标注成片在后台准备；完成后复制、保存共用缓存", EditorStatusTone::Neutral);
+        } else if (selectedFormat_ == OutputFormat::Gif) {
             SetStatus(
                 L"GIF 需要重新生成；耗时取决于片段长度",
                 EditorStatusTone::Neutral);
@@ -2364,12 +2391,14 @@ private:
             request.qualityPercent = media::ExportQuality::DefaultPercent;
         }
         request.destinationPath = destination;
+        request.annotations = annotations_.Snapshot();
         return request;
     }
 
     [[nodiscard]] bool NeedsWarmCache() const {
         const ExportRequest effectiveRequest = BuildExportRequest({});
         return selectedFormat_ == OutputFormat::Gif || trimRangeEdited_ ||
+            annotations::HasVisibleMarks(effectiveRequest.annotations, trimStart_, trimEnd_) ||
             ShouldIncludeSystemAudio() ||
             playbackSpeedTenths_ != EditorSpeedControl::DefaultSpeedTenths ||
             effectiveRequest.qualityPercent <
@@ -3225,6 +3254,7 @@ private:
 
     void SetBusy(const bool busy) {
         busy_ = busy;
+        annotations_.SetEnabled(!busy);
         timeline_.SetEnabled(!busy);
         speedControl_.SetEnabled(!busy);
         qualityControl_.SetEnabled(!busy);
@@ -3436,11 +3466,13 @@ private:
     EditorStatusTone statusTone_{EditorStatusTone::Neutral};
 
     EditorChrome chrome_;
+    EditorAnnotations annotations_;
     TrimTimeline timeline_;
     EditorSpeedControl speedControl_;
     EditorSpeedControl qualityControl_;
     EditorAudioToggle audioToggle_;
     MediaPreview preview_;
+    PreviewSurface previewSurface_;
     MediaExporter exporter_;
     PreparedExportArtifact preparedExportArtifact_;
     RecordingResult recording_;
@@ -3497,7 +3529,6 @@ private:
     bool speedInteractionActive_{};
     bool qualityInteractionActive_{};
     bool mediaItemReady_{};
-    bool previewVideoRefreshPosted_{};
     std::uint64_t timelinePreviewNotificationCount_{};
     std::uint64_t timelineCommittedNotificationCount_{};
     std::uint64_t previewSeekRequestCount_{};
@@ -3567,6 +3598,10 @@ HWND EditorWindow::WindowHandle() const noexcept {
 
 bool EditorWindow::IsOpen() const noexcept {
     return impl_->IsOpen();
+}
+
+bool EditorWindow::HandleAnnotationKey(const MSG& message) {
+    return impl_->HandleAnnotationKey(message);
 }
 
 }  // namespace qrec

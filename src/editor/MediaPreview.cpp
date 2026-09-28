@@ -295,10 +295,8 @@ bool MediaPreview::IsPlaying() const noexcept {
     return SUCCEEDED(player_->GetState(&state)) && state == MFP_MEDIAPLAYER_STATE_PLAYING;
 }
 
-void MediaPreview::UpdateVideo() noexcept {
-    if (player_ != nullptr) {
-        player_->UpdateVideo();
-    }
+bool MediaPreview::UpdateVideo() noexcept {
+    return player_ != nullptr && SUCCEEDED(player_->UpdateVideo());
 }
 
 }  // namespace qrec

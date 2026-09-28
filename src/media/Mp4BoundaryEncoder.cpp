@@ -2,6 +2,7 @@
 
 #include "common/Win32Helpers.h"
 #include "media/Mp4Writer.h"
+#include "annotations/AnnotationCompositor.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -302,7 +303,9 @@ BoundaryStepResult EncodeBoundarySegment(
     const std::filesystem::path& temporaryPath,
     const BoundarySourcePlan& plan,
     const std::stop_token stopToken,
-    BoundaryEncodeResult* output) {
+    BoundaryEncodeResult* output,
+    annotations::Snapshot annotationScene) {
+    annotations::FrameCompositor annotationCompositor(std::move(annotationScene));
     if (output == nullptr || !plan.encodeBoundary ||
         plan.spliceTime <= plan.visibleStart) {
         return MakeBoundaryStep(
@@ -549,6 +552,10 @@ BoundaryStepResult EncodeBoundarySegment(
                 EncoderErrorText(L"规范化边界 BGRA 帧失败", result));
         }
         const LONGLONG outputTime = frameTime - plan.visibleStart;
+        if (!annotationCompositor.Apply(pixels,plan.width,plan.height,plan.width*4U,
+                std::chrono::milliseconds(frameTime/10'000))) {
+            return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Failed,E_FAIL,L"局部视频标注合成失败。");
+        }
         if (!writer->WriteBgraFrame(
                 pixels,
                 plan.width * 4U,

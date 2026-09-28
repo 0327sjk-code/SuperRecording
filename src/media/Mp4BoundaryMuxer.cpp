@@ -415,4 +415,36 @@ BoundaryStepResult RemuxBoundarySegments(
     return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Succeeded, S_OK);
 }
 
+BoundaryStepResult RemuxVideoSegments(
+    IMFMediaType* nativeType, const std::vector<CompressedVideoSegment>& segments,
+    const std::filesystem::path& destinationPath, LONGLONG expectedDuration,
+    std::stop_token stopToken, BoundaryRemuxResult* output) {
+    if (nativeType==nullptr || output==nullptr || segments.empty())
+        return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Failed,E_INVALIDARG,L"标注拼接计划为空。");
+    ComPtr<IMFSinkWriter> writer;
+    DWORD stream=0;
+    auto step=CreateCompressedWriter(destinationPath,nativeType,&writer,&stream);
+    if (!step.Succeeded()) return step;
+    SegmentWriteState state;
+    BoundaryRemuxResult result;
+    for (const auto& segment : segments) {
+        ComPtr<IMFSourceReader> reader; ComPtr<IMFMediaType> type;
+        step=OpenNativeH264Source(segment.path,&reader,&type);
+        if (!step.Succeeded()) return step;
+        step=CompareBoundaryNativeTypes(nativeType,type.Get());
+        if (!step.Succeeded()) return step;
+        std::uint64_t samples=0;
+        step=CopyCompressedRange(reader.Get(),writer.Get(),stream,segment.begin,segment.end,
+            segment.outputBase,stopToken,&state,&samples);
+        if (!step.Succeeded()) return step;
+        if (segment.passthrough) result.passthroughSamples+=samples;
+    }
+    if (!state.wroteAny || state.lastOutputEnd!=expectedDuration)
+        return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Unsupported,MF_E_INVALID_TIMESTAMP,L"标注拼接时间线不完整。");
+    const HRESULT finalized=writer->Finalize(); writer.Reset();
+    if (FAILED(finalized)) return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Failed,finalized,L"标注 MP4 封装失败。");
+    *output=result;
+    return MakeBoundaryStep(Mp4BoundaryTrimOutcome::Succeeded,S_OK);
+}
+
 }  // namespace qrec::detail

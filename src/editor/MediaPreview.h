@@ -44,7 +44,7 @@ public:
     [[nodiscard]] std::chrono::milliseconds Position() const noexcept;
     [[nodiscard]] std::chrono::milliseconds Duration() const noexcept;
     [[nodiscard]] bool IsPlaying() const noexcept;
-    void UpdateVideo() noexcept;
+    bool UpdateVideo() noexcept;
 
 private:
     [[nodiscard]] bool ApplyPlaybackSpeed(

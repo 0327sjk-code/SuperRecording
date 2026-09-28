@@ -1,5 +1,7 @@
 #pragma once
 
+#include "annotations/Annotation.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -97,6 +99,7 @@ struct ExportRequest final {
     int playbackSpeedTenths{10};
     int qualityPercent{100};
     std::filesystem::path destinationPath;
+    annotations::Snapshot annotations;
 };
 
 struct ExportProgress final {

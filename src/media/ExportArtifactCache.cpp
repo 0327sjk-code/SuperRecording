@@ -221,7 +221,7 @@ private:
 }
 
 [[nodiscard]] std::wstring SerializeKey(const ExportArtifactCacheKey& key) {
-    return std::format(
+    std::wstring serialized = std::format(
         L"{}|{}:{}|{}|{}|{}|{}|{}|{}|{}:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         kCacheVersion,
         key.normalizedSourcePath.size(),
@@ -244,6 +244,8 @@ private:
         static_cast<unsigned int>(key.format),
         key.playbackSpeedTenths,
         key.qualityPercent);
+    if (!key.annotationIdentity.empty()) serialized += L"|" + key.annotationIdentity;
+    return serialized;
 }
 
 [[nodiscard]] std::wstring SerializeManifest(
@@ -313,9 +315,10 @@ private:
     hash = HashUnsignedValue(
         hash,
         static_cast<std::uint64_t>(key.playbackSpeedTenths));
-    return HashUnsignedValue(
+    hash = HashUnsignedValue(
         hash,
         static_cast<std::uint64_t>(key.qualityPercent));
+    return key.annotationIdentity.empty() ? hash : StableHash(key.annotationIdentity, hash);
 }
 
 [[nodiscard]] std::wstring NormalizeExtension(const std::wstring_view extension) {
@@ -791,6 +794,13 @@ std::optional<ExportArtifactCacheKey> ExportArtifactCache::BuildKey(
     if (key.has_value()) {
         key->playbackSpeedTenths = request.playbackSpeedTenths;
         key->qualityPercent = request.qualityPercent;
+        if (annotations::HasVisibleMarks(request.annotations, request.trimStart, request.trimEnd)) {
+            try { key->annotationIdentity = request.annotations->Identity(); }
+            catch (...) {
+                if (errorMessage != nullptr) *errorMessage = L"无法创建标注导出缓存。";
+                return std::nullopt;
+            }
+        }
     }
     if (!key.has_value() || !request.includeSystemAudio) {
         return key;

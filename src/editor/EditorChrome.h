@@ -25,6 +25,16 @@ enum class EditorButtonRole : unsigned char {
     SegmentRight,
     Primary,
     Secondary,
+    PlainText,
+    AnnotationSelect,
+    AnnotationPen,
+    AnnotationCircle,
+    AnnotationArrow,
+    AnnotationText,
+    AnnotationUndo,
+    AnnotationRedo,
+    AnnotationDelete,
+    AnnotationColor,
 };
 
 struct EditorButtonPaintState final {
@@ -32,6 +42,7 @@ struct EditorButtonPaintState final {
     bool selected{};
     bool playing{};
     bool busy{};
+    COLORREF iconColor{};
 };
 
 struct EditorChromeLayout final {
@@ -39,6 +50,8 @@ struct EditorChromeLayout final {
     RECT headerSubtitle{};
     RECT previewStage{};
     RECT preview{};
+    RECT annotationTools{};
+    RECT annotationTrack{};
     RECT rangeLabel{};
     RECT qualityControl{};
     RECT outputSizeLabel{};

@@ -50,6 +50,7 @@
     <ClCompile Include="..\src\capture\SystemAudioTimelinePolicy.cpp" />
     <ClCompile Include="..\src\common\Win32Helpers.cpp" />
     <ClCompile Include="..\src\media\*.cpp" />
+    <ClCompile Include="..\src\annotations\*.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\capture\SystemAudioCapture.h" />

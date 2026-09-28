@@ -2,6 +2,8 @@
 
 #include "media/Mp4BoundaryEncoderPool.h"
 #include "media/Mp4BoundaryTrimmer.h"
+#include "annotations/Annotation.h"
+#include <vector>
 
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -100,7 +102,18 @@ struct BoundaryRemuxResult final {
     const std::filesystem::path& temporaryPath,
     const BoundarySourcePlan& plan,
     std::stop_token stopToken,
-    BoundaryEncodeResult* output);
+    BoundaryEncodeResult* output,
+    annotations::Snapshot annotations = {});
+
+struct CompressedVideoSegment final {
+    std::filesystem::path path;
+    LONGLONG begin{},end{},outputBase{};
+    bool passthrough{};
+};
+[[nodiscard]] BoundaryStepResult RemuxVideoSegments(
+    IMFMediaType* nativeType, const std::vector<CompressedVideoSegment>& segments,
+    const std::filesystem::path& destinationPath, LONGLONG expectedDuration,
+    std::stop_token stopToken, BoundaryRemuxResult* output);
 
 [[nodiscard]] BoundaryStepResult ValidateBoundaryCompatibility(
     const std::filesystem::path& temporaryPath,

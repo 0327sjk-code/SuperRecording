@@ -274,11 +274,19 @@ int AppController::Run() {
         }
         if (editor_ && editor_->IsOpen()) {
             const HWND editorWindow = editor_->WindowHandle();
-            if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            if (editor_->HandleAnnotationKey(message)) continue;
+            wchar_t inputClass[32]{};
+            bool textInput = GetClassNameW(message.hwnd,inputClass,_countof(inputClass))>0 &&
+                _wcsicmp(inputClass,L"Edit")==0;
+            if (!textInput) {
+                textInput = GetClassNameW(GetFocus(),inputClass,_countof(inputClass))>0 &&
+                    _wcsicmp(inputClass,L"Edit")==0;
+            }
+            if (!textInput && message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
                 ::SendMessageW(editorWindow, message.message, message.wParam, message.lParam);
                 continue;
             }
-            if (message.message == WM_KEYDOWN && message.wParam == VK_SPACE) {
+            if (!textInput && message.message == WM_KEYDOWN && message.wParam == VK_SPACE) {
                 wchar_t focusClass[32]{};
                 const HWND focused = ::GetFocus();
                 const bool buttonFocused =

@@ -48,6 +48,7 @@ public:
 
     [[nodiscard]] HWND WindowHandle() const noexcept;
     [[nodiscard]] bool IsOpen() const noexcept;
+    [[nodiscard]] bool HandleAnnotationKey(const MSG& message);
 
 private:
     class Impl;
