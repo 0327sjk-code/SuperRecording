@@ -44,5 +44,7 @@ set_target_properties(SuperRecording PROPERTIES
   MACOSX_BUNDLE_BUNDLE_VERSION "17001")
 enable_testing()
 add_test(NAME mac_core COMMAND $<TARGET_FILE:SuperRecording> --self-test)
+add_test(NAME mac_app_startup COMMAND $<TARGET_FILE:SuperRecording> --app-test)
 add_test(NAME mac_media COMMAND $<TARGET_FILE:SuperRecording> --media-test ${CMAKE_BINARY_DIR}/test-results)
+set_tests_properties(mac_app_startup PROPERTIES TIMEOUT 20)
 set_tests_properties(mac_media PROPERTIES TIMEOUT 180)

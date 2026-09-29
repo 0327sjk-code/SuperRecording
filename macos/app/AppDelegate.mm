@@ -58,6 +58,10 @@
         [self menuNeedsUpdate:_menu]; [_statusItem popUpStatusItemMenu:_menu];
     } else [self startRecording:nil];
 }
+- (BOOL)isMenuBarReady {
+    [self menuNeedsUpdate:_menu];
+    return _statusItem.button!=nil && _hotKey!=nil && _menu.numberOfItems>=10;
+}
 - (NSMenuItem*)item:(NSString*)title action:(SEL)action {
     NSMenuItem* item=[_menu addItemWithTitle:title action:action keyEquivalent:@""]; item.target=self; return item;
 }
