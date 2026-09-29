@@ -6,6 +6,7 @@
   <key>CFBundleIdentifier</key><string>com.superrecording.mac</string>
   <key>CFBundleExecutable</key><string>SuperRecording</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>SuperRecording</string>
   <key>CFBundleShortVersionString</key><string>1.7.0</string>
   <key>CFBundleVersion</key><string>17001</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

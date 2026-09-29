@@ -4,10 +4,11 @@
 #include <algorithm>
 #include <optional>
 using namespace qrec::annotations;
+using AnnotationPoint = qrec::annotations::Point;
 @implementation SRAnnotationView {
     std::optional<Mark> _draft;
     Mark _original;
-    Point _anchor;
+    AnnotationPoint _anchor;
     BOOL _moving;
     NSTextView* _text;
 }
@@ -23,7 +24,7 @@ using namespace qrec::annotations;
     NSSize size=NSMakeSize(self.sourceSize.width*scale,self.sourceSize.height*scale);
     return NSMakeRect((self.bounds.size.width-size.width)/2,(self.bounds.size.height-size.height)/2,size.width,size.height);
 }
-- (Point)sourcePoint:(NSEvent*)event {
+- (AnnotationPoint)sourcePoint:(NSEvent*)event {
     NSPoint point=[self convertPoint:event.locationInWindow fromView:nil]; NSRect rect=self.videoRect;
     CGFloat scale=rect.size.width/self.sourceSize.width;
     return {(float)((point.x-rect.origin.x)/scale),(float)((point.y-rect.origin.y)/scale)};
@@ -46,7 +47,7 @@ using namespace qrec::annotations;
     if (self.willInteract) self.willInteract();
     [self.window makeFirstResponder:self];
     if (!self.document || !NSPointInRect([self convertPoint:event.locationInWindow fromView:nil],self.videoRect)) return;
-    Point point=[self sourcePoint:event]; _anchor=point; _moving=NO;
+    AnnotationPoint point=[self sourcePoint:event]; _anchor=point; _moving=NO;
     float tolerance=(float)(7*self.sourceSize.width/self.videoRect.size.width);
     const auto& marks=self.document->Current()->Marks();
     for (auto it=marks.rbegin();it!=marks.rend();++it) {
@@ -66,10 +67,10 @@ using namespace qrec::annotations;
 }
 - (void)mouseDragged:(NSEvent*)event {
     if (!_draft || _text) return;
-    Point point=[self sourcePoint:event];
+    AnnotationPoint point=[self sourcePoint:event];
     if (_moving) { *_draft=_original; Translate(*_draft,{point.x-_anchor.x,point.y-_anchor.y}); }
     else if (_draft->tool==Tool::Pen) {
-        Point last=_draft->points.back();
+        AnnotationPoint last=_draft->points.back();
         if (std::hypot(point.x-last.x,point.y-last.y)>=0.6 && _draft->points.size()<MaximumPoints) _draft->points.push_back(point);
     } else if (_draft->points.size()==2) _draft->points.back()=point;
     self.needsDisplay=YES;

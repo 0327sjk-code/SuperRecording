@@ -10,7 +10,15 @@ set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Oldest supported macOS")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(APP_ICON "${CMAKE_BINARY_DIR}/SuperRecording.icns")
+add_custom_command(OUTPUT "${APP_ICON}"
+  COMMAND xcrun swift "${CMAKE_CURRENT_SOURCE_DIR}/tools/MakeIcon.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../assets/SuperRecording.ico" "${APP_ICON}"
+  DEPENDS tools/MakeIcon.swift ../assets/SuperRecording.ico
+  VERBATIM)
+set_source_files_properties("${APP_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources GENERATED TRUE)
 add_executable(SuperRecording MACOSX_BUNDLE
+  "${APP_ICON}"
   app/Main.mm app/AppDelegate.mm app/Preferences.mm app/HotKey.mm app/UpdateChecker.mm
   common/Support.mm
   capture/RegionSelector.mm capture/RecordingHUD.mm capture/Recorder.mm
