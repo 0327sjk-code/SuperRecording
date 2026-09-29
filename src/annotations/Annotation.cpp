@@ -4,7 +4,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <format>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace qrec::annotations {
@@ -24,20 +25,30 @@ bool FinitePositive(float value) noexcept { return std::isfinite(value) && value
 
 std::wstring Serialize(Size size, const std::vector<Mark>& marks) {
     if (marks.empty()) return {};
-    std::wstring value = std::format(L"annotations-v2:{:08x}:{:08x}",
-        std::bit_cast<std::uint32_t>(size.width), std::bit_cast<std::uint32_t>(size.height));
+    // Keep the wire identity independent of std::format's OS availability.
+    std::wostringstream stream;
+    stream.imbue(std::locale::classic());
+    const auto hex = [&](std::uint32_t value, int digits = 8) {
+        stream << std::hex << std::setfill(L'0') << std::setw(digits) << value << std::dec;
+    };
+    stream << L"annotations-v2:";
+    hex(std::bit_cast<std::uint32_t>(size.width)); stream << L':';
+    hex(std::bit_cast<std::uint32_t>(size.height));
     for (const Mark& mark : marks) {
-        value += std::format(L"|{}:{}:{}:{:08x}:{:08x}:{:08x}:{}:",
-            static_cast<unsigned>(mark.tool), mark.start.count(), mark.end.count(), mark.argb,
-            std::bit_cast<std::uint32_t>(mark.strokeWidth), std::bit_cast<std::uint32_t>(mark.fontSize),
-            mark.text.size());
+        stream << L'|' << static_cast<unsigned>(mark.tool) << L':' << mark.start.count()
+               << L':' << mark.end.count() << L':';
+        hex(mark.argb); stream << L':';
+        hex(std::bit_cast<std::uint32_t>(mark.strokeWidth)); stream << L':';
+        hex(std::bit_cast<std::uint32_t>(mark.fontSize)); stream << L':' << mark.text.size() << L':';
         // Hex encoding prevents text from impersonating manifest separators.
-        for (wchar_t c : mark.text) value += std::format(L"{:04x}", static_cast<unsigned>(c));
-        value += std::format(L":{}", mark.points.size());
-        for (Point p : mark.points) value += std::format(L":{:08x},{:08x}",
-            std::bit_cast<std::uint32_t>(p.x), std::bit_cast<std::uint32_t>(p.y));
+        for (wchar_t c : mark.text) hex(static_cast<unsigned>(c), 4);
+        stream << L':' << mark.points.size();
+        for (Point p : mark.points) {
+            stream << L':'; hex(std::bit_cast<std::uint32_t>(p.x));
+            stream << L','; hex(std::bit_cast<std::uint32_t>(p.y));
+        }
     }
-    return value;
+    return stream.str();
 }
 }  // namespace
 

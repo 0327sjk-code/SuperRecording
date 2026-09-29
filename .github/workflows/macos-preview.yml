@@ -1,0 +1,56 @@
+name: macOS preview
+on:
+  push:
+    branches: [macos-preview]
+    paths: ['macos/**', 'src/annotations/**', 'src/media/ExportQuality*', '.github/workflows/macos-preview.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-preview-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure universal app
+        run: cmake -S macos -B mac-build -DCMAKE_BUILD_TYPE=Release '-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64' -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+      - name: Build
+        run: cmake --build mac-build --parallel 3
+      - name: Ad-hoc sign and verify
+        run: |
+          codesign --force --deep --sign - mac-build/SuperRecording.app
+          codesign --verify --deep --strict --verbose=2 mac-build/SuperRecording.app
+          lipo -info mac-build/SuperRecording.app/Contents/MacOS/SuperRecording
+          otool -l mac-build/SuperRecording.app/Contents/MacOS/SuperRecording | grep -A5 LC_BUILD_VERSION
+      - name: Test core and synthetic media
+        run: ctest --test-dir mac-build --output-on-failure
+      - name: Package
+        if: matrix.os == 'macos-15'
+        run: |
+          mkdir -p mac-package
+          cp -R mac-build/SuperRecording.app mac-package/
+          ln -s /Applications mac-package/Applications
+          hdiutil create -volname 'SuperRecording Mac 试用版' -srcfolder mac-package -ov -format UDZO SuperRecording-macOS-universal.dmg
+          ditto -c -k --keepParent mac-build/SuperRecording.app SuperRecording-macOS-universal.zip
+          shasum -a 256 SuperRecording-macOS-universal.dmg SuperRecording-macOS-universal.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'macos-15'
+        with:
+          name: SuperRecording-macOS-universal
+          path: |
+            SuperRecording-macOS-universal.dmg
+            SuperRecording-macOS-universal.zip
+            SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macOS-tests-${{ matrix.os }}
+          path: |
+            mac-build/test-results/
+            mac-build/Testing/Temporary/LastTest.log

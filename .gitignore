@@ -23,3 +23,9 @@
 *.bak
 
 /.SuperRecording-cache/
+
+/mac-build/
+/mac-package/
+/artifacts/
+*.dmg
+.DS_Store
