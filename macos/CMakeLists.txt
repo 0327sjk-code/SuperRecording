@@ -22,7 +22,7 @@ add_executable(SuperRecording MACOSX_BUNDLE
   app/Main.mm app/AppDelegate.mm app/Preferences.mm app/HotKey.mm app/UpdateChecker.mm
   common/Support.mm common/ActionButton.mm
   capture/RegionSelector.mm capture/RecordingHUD.mm capture/Recorder.mm
-  media/ExportJob.mm media/ExportComposition.mm media/GifExporter.mm media/ExportCoordinator.mm
+  media/ExportJob.mm media/ExportComposition.mm media/GifExporter.mm media/Transcoder.mm media/ExportCoordinator.mm
   editor/EditorController.mm editor/EditorLayout.mm editor/AnnotationView.mm
   editor/TimelineView.mm editor/AnnotationDrawing.mm
   tests/SelfTest.mm tests/MediaTests.mm tests/UITests.mm

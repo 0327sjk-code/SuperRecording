@@ -13,7 +13,7 @@
 }
 - (NSString*)cacheKey {
     NSString* identity=self.annotations?sr::String(self.annotations->Identity()):@"";
-    NSString* value=[NSString stringWithFormat:@"%@|%@|%.6f|%.6f|%.3f|%ld|%ld|%d|%d|%@",
+    NSString* value=[NSString stringWithFormat:@"mac-export-v2|%@|%@|%.6f|%.6f|%.3f|%ld|%ld|%d|%d|%@",
         self.videoURL.path,self.audioURL.path,self.start,self.end,self.speed,(long)self.quality,(long)self.fps,self.audio,self.gif,identity];
     NSData* data=[value dataUsingEncoding:NSUTF8StringEncoding]; unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(data.bytes,(CC_LONG)data.length,digest);
@@ -59,13 +59,17 @@
                 finished(error); return;
             }
             BOOL render=marks || request.quality!=100 || fabs(request.speed-1)>0.001;
+            if (render) {
+                if (!SRTranscode(composition,request,partial,self,&error) && !self.cancelled && !error)
+                    error=sr::Error(@"视频合成失败，原始文件已保留。");
+                finished(error); return;
+            }
             AVAssetExportSession* session=[[AVAssetExportSession alloc] initWithAsset:composition
-                presetName:render?AVAssetExportPresetHighestQuality:AVAssetExportPresetPassthrough];
+                presetName:AVAssetExportPresetPassthrough];
             if (!session) { finished(sr::Error(@"此系统无法创建视频导出器。")); return; }
             session.outputURL=partial; session.outputFileType=AVFileTypeMPEG4;
             session.shouldOptimizeForNetworkUse=YES;
             session.audioTimePitchAlgorithm=AVAudioTimePitchAlgorithmVarispeed;
-            if (render) session.videoComposition=SRVideoComposition(composition,request,NO);
             self.session=session;
             if (self.cancelled) { finished(nil); return; }
             [session exportAsynchronouslyWithCompletionHandler:^{

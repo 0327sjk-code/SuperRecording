@@ -4,3 +4,4 @@
 AVMutableComposition* SRComposition(SRExportRequest* request,NSError** error);
 AVMutableVideoComposition* SRVideoComposition(AVAsset* asset,SRExportRequest* request,BOOL gif);
 BOOL SRExportGIF(AVAsset* asset,SRExportRequest* request,NSURL* output,SRExportJob* job,NSError** error);
+BOOL SRTranscode(AVAsset* asset,SRExportRequest* request,NSURL* output,SRExportJob* job,NSError** error);
