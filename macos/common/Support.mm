@@ -1,4 +1,5 @@
 #import "common/Support.h"
+#import "common/ActionButton.h"
 #include <copyfile.h>
 #include <sys/clonefile.h>
 #include <cerrno>
@@ -34,7 +35,7 @@ NSString* TimeLabel(double seconds) {
 }
 CMTime Time(double seconds) { return CMTimeMakeWithSeconds(seconds, TimeScale); }
 NSButton* Button(NSString* title, NSString* symbol, id target, SEL action) {
-    NSButton* button=[NSButton buttonWithTitle:title target:target action:action];
+    NSButton* button=[SRActionButton buttonWithTitle:title target:target action:action];
     button.bezelStyle=NSBezelStyleRounded;
     button.font=[NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     if (symbol.length) {

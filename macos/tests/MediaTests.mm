@@ -176,6 +176,7 @@ int SRMediaTests(NSURL* directory) {
             Check([[NSData dataWithContentsOfURL:rendered] isEqual:[NSData dataWithContentsOfURL:delivered]],"delivered bytes match cache exactly");
             SRPreferences* preferences=[SRPreferences new];
             SREditorController* editor=[[SREditorController alloc] initWithRecording:recording preferences:preferences];
+            SRUITests(editor);
             [editor writeUISnapshot:[directory URLByAppendingPathComponent:@"editor.png"]];
             [editor.window setContentSize:NSMakeSize(1000,680)];
             [editor writeUISnapshot:[directory URLByAppendingPathComponent:@"editor-compact.png"]];

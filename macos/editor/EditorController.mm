@@ -17,7 +17,7 @@ using namespace qrec::annotations;
         _recording=recording; _preferences=preferences;
         window.title=@"SuperRecording · 编辑录屏"; window.delegate=self; window.releasedWhenClosed=NO;
         window.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-        window.backgroundColor=sr::Color(0x121315); window.contentMinSize=NSMakeSize(1000,680); [window center];
+        window.backgroundColor=sr::Color(0x121315); window.contentMinSize=NSMakeSize(960,600); [window center];
         AVURLAsset* asset=[AVURLAsset URLAssetWithURL:recording.videoURL options:nil];
         _duration=CMTimeGetSeconds(asset.duration);
         if (!std::isfinite(_duration) || _duration<=0) _duration=1.0/recording.fps;

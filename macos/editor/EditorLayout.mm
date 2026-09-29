@@ -82,9 +82,10 @@
     _sidebar.frame=NSMakeRect(16,74,64,stageHeight); _stage.frame=NSMakeRect(92,74,w-112,stageHeight);
     [CATransaction begin]; [CATransaction setDisableActions:YES]; _videoLayer.frame=_stage.bounds; [CATransaction commit];
     _canvas.frame=_stage.bounds;
-    for (NSUInteger i=0;i<_tools.count;++i) _tools[i].frame=NSMakeRect(14,stageHeight-44-i*42,36,34);
+    CGFloat toolStep=MIN(42,(stageHeight-145)/5);
+    for (NSUInteger i=0;i<_tools.count;++i) _tools[i].frame=NSMakeRect(14,stageHeight-42-i*toolStep,36,MIN(32,toolStep-3));
     // Sidebar is a normal (bottom-left) NSView; place tools top-down explicitly.
-    CGFloat below=stageHeight-263;
+    CGFloat below=stageHeight-36-5*toolStep;
     _undo.frame=NSMakeRect(3,below,20,24); _redo.frame=NSMakeRect(22,below,20,24); _delete.frame=NSMakeRect(41,below,20,24);
     _colorLabel.frame=NSMakeRect(7,below-40,30,18); _color.frame=NSMakeRect(38,below-43,22,24);
     _widthLabel.frame=NSMakeRect(7,below-75,54,18); _width.frame=NSMakeRect(5,below-99,54,20);

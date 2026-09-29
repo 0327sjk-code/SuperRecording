@@ -3,3 +3,5 @@
 #import <Foundation/Foundation.h>
 int SRCoreTests();
 int SRMediaTests(NSURL* directory);
+@class SREditorController;
+void SRUITests(SREditorController* editor);

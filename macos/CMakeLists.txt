@@ -20,12 +20,12 @@ set_source_files_properties("${APP_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Res
 add_executable(SuperRecording MACOSX_BUNDLE
   "${APP_ICON}"
   app/Main.mm app/AppDelegate.mm app/Preferences.mm app/HotKey.mm app/UpdateChecker.mm
-  common/Support.mm
+  common/Support.mm common/ActionButton.mm
   capture/RegionSelector.mm capture/RecordingHUD.mm capture/Recorder.mm
   media/ExportJob.mm media/ExportComposition.mm media/GifExporter.mm media/ExportCoordinator.mm
   editor/EditorController.mm editor/EditorLayout.mm editor/AnnotationView.mm
   editor/TimelineView.mm editor/AnnotationDrawing.mm
-  tests/SelfTest.mm tests/MediaTests.mm
+  tests/SelfTest.mm tests/MediaTests.mm tests/UITests.mm
   ../src/annotations/Annotation.cpp ../src/media/ExportQuality.cpp)
 target_include_directories(SuperRecording PRIVATE . ../src)
 target_compile_options(SuperRecording PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -Wall -Wextra -Werror
