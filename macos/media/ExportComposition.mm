@@ -95,6 +95,9 @@ AVMutableVideoComposition* SRVideoComposition(AVAsset* asset,SRExportRequest* re
     AVMutableVideoComposition* composition=[AVMutableVideoComposition videoCompositionWithAsset:asset
         applyingCIFiltersWithHandler:^(AVAsynchronousCIImageFilteringRequest* frame) { [renderer render:frame]; }];
     composition.renderSize=CGSizeMake(size.width,size.height);
+    // The CI factory inherits the source track clock. Disable it so speed edits do not
+    // silently multiply FPS, and GIF consumes the entire interval rather than its prefix.
+    composition.sourceTrackIDForFrameTiming=kCMPersistentTrackID_Invalid;
     composition.frameDuration=CMTimeMake(1,(int32_t)(gif?MIN(20,request.fps):request.fps));
     return composition;
 }

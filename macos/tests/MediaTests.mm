@@ -134,6 +134,18 @@ size_t RedPixels(NSURL* url,double time,NSURL* png) {
     for (size_t p=0;p<pixels.size();p+=4) if (pixels[p]>pixels[p+1]+45 && pixels[p]>130) ++red;
     CGContextRelease(context); CGColorSpaceRelease(space); CGImageRelease(image); return red;
 }
+double WhiteBarPosition(CGImageRef image) {
+    size_t w=CGImageGetWidth(image),h=CGImageGetHeight(image); std::vector<uint8_t> pixels(w*h*4);
+    CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
+    CGContextRef context=CGBitmapContextCreate(pixels.data(),w,h,8,w*4,space,
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast)|kCGBitmapByteOrder32Big);
+    CGContextDrawImage(context,CGRectMake(0,0,w,h),image); double total=0,count=0;
+    for (size_t x=0;x<w;++x) {
+        size_t p=(h/2*w+x)*4;
+        if (pixels[p]>175 && pixels[p+1]>175 && pixels[p+2]>175) { total+=x; ++count; }
+    }
+    CGContextRelease(context); CGColorSpaceRelease(space); return count?total/count:-1;
+}
 }
 int SRMediaTests(NSURL* directory) {
     @try {
@@ -162,6 +174,8 @@ int SRMediaTests(NSURL* directory) {
             Check(fabs(CMTimeGetSeconds(renderedAsset.duration)-0.8)<0.06,"speed conversion duration");
             CGSize size=[renderedAsset tracksWithMediaType:AVMediaTypeVideo].firstObject.naturalSize;
             Check(size.width==160 && size.height==90,"quality export size");
+            Check(fabs([renderedAsset tracksWithMediaType:AVMediaTypeVideo].firstObject.nominalFrameRate-60)<0.1,
+                  "speed export retains selected 60 FPS rather than multiplying frame rate");
             Check(AudioRMS(renderedAsset)>0.09,"speed conversion keeps audible audio");
             size_t visible=RedPixels(rendered,0.2,[directory URLByAppendingPathComponent:@"annotations-visible.png"]);
             size_t hidden=RedPixels(rendered,0.7,[directory URLByAppendingPathComponent:@"annotations-hidden.png"]);
@@ -170,7 +184,18 @@ int SRMediaTests(NSURL* directory) {
             NSURL* gif=Export(request);
             CGImageSourceRef gifSource=CGImageSourceCreateWithURL((__bridge CFURLRef)gif,nullptr);
             Check(gifSource && CGImageSourceGetCount(gifSource)>=12,"GIF contains expected animation frames");
-            if (gifSource) CFRelease(gifSource);
+            CGImageRef last=CGImageSourceCreateImageAtIndex(gifSource,CGImageSourceGetCount(gifSource)-1,nullptr);
+            Check(last!=nullptr,"last GIF frame decodes");
+            double lastBar=WhiteBarPosition(last);
+            std::cout<<"Last GIF frame white bar x: "<<lastBar<<'\n';
+            Check(lastBar>75 && lastBar<95,"GIF reaches end of selected source range at 1.5x speed");
+            CGImageRelease(last); CFRelease(gifSource);
+            request.gif=NO; request.annotations=nullptr; request.audio=YES; request.start=0.3; request.end=0.5;
+            request.speed=0.1; request.quality=25; request.fps=30;
+            AVURLAsset* slow=[AVURLAsset URLAssetWithURL:Export(request) options:nil];
+            Check(fabs(CMTimeGetSeconds(slow.duration)-2)<0.05,"0.1x slow export duration");
+            Check(fabs([slow tracksWithMediaType:AVMediaTypeVideo].firstObject.nominalFrameRate-30)<0.1,"slow export retains 30 FPS");
+            Check(AudioRMS(slow)>0.07,"0.1x export retains continuous audio");
             NSURL* delivered=[directory URLByAppendingPathComponent:@"delivered.mp4"];
             Check(sr::DeliverFile(rendered,delivered,&error),"atomic file delivery");
             Check([[NSData dataWithContentsOfURL:rendered] isEqual:[NSData dataWithContentsOfURL:delivered]],"delivered bytes match cache exactly");
