@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 namespace {
 void Check(bool value,const char* label) {
     if (!value) throw std::runtime_error(label);
@@ -29,8 +30,9 @@ void Ready(AVAssetWriterInput* input,AVAssetWriter* writer) {
 }
 void Finish(AVAssetWriter* writer,AVAssetWriterInput* input) {
     [writer endSessionAtSourceTime:CMTimeMake(2,1)]; [input markAsFinished];
-    __block BOOL done=NO; [writer finishWritingWithCompletionHandler:^{ done=YES; }];
-    Check(Pump(^BOOL{ return done; }) && writer.status==AVAssetWriterStatusCompleted,"synthetic source finalized");
+    auto done=std::make_shared<std::atomic_bool>(false);
+    [writer finishWritingWithCompletionHandler:^{ done->store(true); }];
+    Check(Pump(^BOOL{ return done->load(); }) && writer.status==AVAssetWriterStatusCompleted,"synthetic source finalized");
 }
 SRRecording* Fixture(NSURL* directory) {
     SRRecording* recording=[SRRecording new]; recording.size=CGSizeMake(320,180); recording.fps=60;
@@ -126,7 +128,8 @@ size_t RedPixels(NSURL* url,double time,NSURL* png) {
     }
     size_t w=CGImageGetWidth(image),h=CGImageGetHeight(image); std::vector<uint8_t> pixels(w*h*4);
     CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    CGContextRef context=CGBitmapContextCreate(pixels.data(),w,h,8,w*4,space,kCGImageAlphaPremultipliedLast|kCGBitmapByteOrder32Big);
+    CGContextRef context=CGBitmapContextCreate(pixels.data(),w,h,8,w*4,space,
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast)|kCGBitmapByteOrder32Big);
     CGContextDrawImage(context,CGRectMake(0,0,w,h),image); size_t red=0;
     for (size_t p=0;p<pixels.size();p+=4) if (pixels[p]>pixels[p+1]+45 && pixels[p]>130) ++red;
     CGContextRelease(context); CGColorSpaceRelease(space); CGImageRelease(image); return red;

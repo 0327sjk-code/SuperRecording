@@ -6,6 +6,7 @@
 #include "core/CaptureClock.h"
 #include "media/ExportQuality.h"
 #include <vector>
+#include <deque>
 @implementation SRRecording @end
 @interface SRRecorder () <SCStreamOutput,SCStreamDelegate>
 @property(atomic, readwrite) double recordedSeconds;
@@ -25,6 +26,8 @@
     SRRecording* _recording;
     int64_t _lastFrameIndex;
     double _lastAudioEnd;
+    double _finishDeadline;
+    std::deque<CMSampleBufferRef> _audioPending;
     BOOL _stopping;
     NSError* _fatalError;
 }
@@ -68,8 +71,11 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
                 [self->_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:self->_queue error:&setupError];
             if (!ok) { dispatch_async(dispatch_get_main_queue(),^{ completion(setupError); }); return; }
             [self->_stream startCaptureWithCompletionHandler:^(NSError* startError) {
-                if (!startError) dispatch_async(self->_queue, ^{ [self startTimer]; });
-                dispatch_async(dispatch_get_main_queue(),^{ completion(startError); });
+                dispatch_async(self->_queue, ^{
+                    NSError* failure=startError ?: self->_fatalError;
+                    if (!failure) [self startTimer];
+                    dispatch_async(dispatch_get_main_queue(),^{ completion(failure); });
+                });
             }];
         });
     }];
@@ -109,6 +115,7 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     dispatch_resume(_timer);
 }
 - (void)appendVideoAt:(double)host {
+    [self drainAudio];
     if (_stopping || !_latestFrame || _clock.Paused() || !_clock.Started()) return;
     double seconds=_clock.Elapsed(host); self.recordedSeconds=seconds;
     int64_t index=(int64_t)floor(seconds*_recording.fps);
@@ -136,7 +143,10 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
         if (![_audioWriter startWriting]) { [self fail:_audioWriter.error]; return; }
         [_audioWriter startSessionAtSourceTime:kCMTimeZero];
     }
-    if (!_audioInput.readyForMoreMediaData) { sr::Log(@"audio",@"Encoder backpressure: packet skipped"); return; }
+    constexpr size_t maximumPendingPackets=200;
+    if (_audioPending.size()>=maximumPendingPackets) {
+        [self fail:sr::Error(@"音频编码器处理过慢，录制已停止。请尝试 30 FPS 或较小选区。")]; return;
+    }
     CMItemCount count=0;
     if (CMSampleBufferGetSampleTimingInfoArray(sample,0,nullptr,&count)!=noErr || count<=0) return;
     std::vector<CMSampleTimingInfo> timing((size_t)count);
@@ -148,8 +158,15 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     }
     CMSampleBufferRef adjusted=nullptr;
     if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault,sample,count,timing.data(),&adjusted)==noErr) {
-        if (![_audioInput appendSampleBuffer:adjusted]) [self fail:_audioWriter.error];
-        _lastAudioEnd=time+CMTimeGetSeconds(CMSampleBufferGetDuration(sample)); CFRelease(adjusted);
+        _audioPending.push_back(adjusted);
+        _lastAudioEnd=time+CMTimeGetSeconds(CMSampleBufferGetDuration(sample)); [self drainAudio];
+    }
+}
+- (void)drainAudio {
+    while (!_audioPending.empty() && _audioInput.readyForMoreMediaData && !_fatalError) {
+        CMSampleBufferRef sample=_audioPending.front(); _audioPending.pop_front();
+        BOOL appended=[_audioInput appendSampleBuffer:sample]; CFRelease(sample);
+        if (!appended) { [self fail:_audioWriter.error]; break; }
     }
 }
 - (void)togglePause {
@@ -171,6 +188,7 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     dispatch_async(_queue, ^{
         if (self->_stopping) return;
         [self appendVideoAt:HostNow()]; self->_stopping=YES;
+        self->_finishDeadline=HostNow()+5;
         if (self->_timer) { dispatch_source_cancel(self->_timer); self->_timer=nil; }
         self.recordedSeconds=self->_clock.Elapsed(HostNow());
         [self->_stream stopCaptureWithCompletionHandler:^(NSError* stopError) {
@@ -179,6 +197,12 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     });
 }
 - (void)finish:(void (^)(SRRecording*,NSError*))completion {
+    [self drainAudio];
+    if (!_audioPending.empty() && !_fatalError && HostNow()<_finishDeadline) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_MSEC*10),_queue,^{ [self finish:completion]; }); return;
+    }
+    if (!_audioPending.empty() && !_fatalError) _fatalError=sr::Error(@"音频编码器未能完成，原始录制已保留。请尝试较小选区。");
+    for (CMSampleBufferRef sample:_audioPending) CFRelease(sample); _audioPending.clear();
     dispatch_group_t group=dispatch_group_create();
     if (_lastFrameIndex<0) _fatalError=sr::Error(@"没有收到屏幕画面。请授权屏幕录制后重新打开软件。");
     for (AVAssetWriter* writer in @[_videoWriter,_audioWriter]) {
@@ -197,5 +221,8 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
         dispatch_async(dispatch_get_main_queue(),^{ completion(error?nil:self->_recording,error); });
     });
 }
-- (void)dealloc { if (_latestFrame) CVPixelBufferRelease(_latestFrame); }
+- (void)dealloc {
+    if (_latestFrame) CVPixelBufferRelease(_latestFrame);
+    for (CMSampleBufferRef sample:_audioPending) CFRelease(sample);
+}
 @end

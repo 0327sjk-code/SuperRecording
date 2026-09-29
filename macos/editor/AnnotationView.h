@@ -5,7 +5,7 @@
 @interface SRAnnotationView : NSView <NSTextViewDelegate>
 @property(nonatomic) qrec::annotations::Document* document;
 @property(nonatomic) qrec::annotations::Tool tool;
-@property double time;
+@property(nonatomic) double time;
 @property CGFloat strokeWidth;
 @property uint32_t argb;
 @property uint64_t selectedID;

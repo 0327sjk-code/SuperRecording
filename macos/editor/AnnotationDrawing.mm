@@ -60,7 +60,7 @@ CGImageRef AnnotationImage(const qrec::annotations::Snapshot& scene,double time)
     const size_t width=(size_t)ceil(scene->Canvas().width),height=(size_t)ceil(scene->Canvas().height);
     CGColorSpaceRef space=CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef context=CGBitmapContextCreate(nullptr,width,height,8,width*4,space,
-        kCGImageAlphaPremultipliedLast|kCGBitmapByteOrder32Big);
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast)|kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(space); if (!context) return nullptr;
     CGContextTranslateCTM(context,0,height); CGContextScaleCTM(context,1,-1);
     DrawScene(context,scene,time);
