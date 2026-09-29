@@ -65,15 +65,18 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
         config.sampleRate=48000; config.channelCount=2; config.colorSpaceName=kCGColorSpaceSRGB;
         dispatch_async(self->_queue, ^{
             NSError* setupError=nil;
-            if (![self prepareWriters:&setupError]) { dispatch_async(dispatch_get_main_queue(),^{ completion(setupError); }); return; }
+            if (![self prepareWriters:&setupError]) {
+                [self cancelPreparedCapture]; dispatch_async(dispatch_get_main_queue(),^{ completion(setupError); }); return;
+            }
             self->_stream=[[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
             BOOL ok=[self->_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self->_queue error:&setupError] &&
                 [self->_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:self->_queue error:&setupError];
-            if (!ok) { dispatch_async(dispatch_get_main_queue(),^{ completion(setupError); }); return; }
+            if (!ok) { [self cancelPreparedCapture]; dispatch_async(dispatch_get_main_queue(),^{ completion(setupError); }); return; }
             [self->_stream startCaptureWithCompletionHandler:^(NSError* startError) {
                 dispatch_async(self->_queue, ^{
                     NSError* failure=startError ?: self->_fatalError;
                     if (!failure) [self startTimer];
+                    else [self cancelPreparedCapture];
                     dispatch_async(dispatch_get_main_queue(),^{ completion(failure); });
                 });
             }];
@@ -95,7 +98,8 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     [_videoWriter addInput:_videoInput];
     _adaptor=[AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:_videoInput
                                                                        sourcePixelBufferAttributes:nil];
-    _videoWriter.shouldOptimizeForNetworkUse=YES;
+    // Keep stop latency independent of file size; edited exports optimize placement in the background.
+    _videoWriter.shouldOptimizeForNetworkUse=NO;
     if (![_videoWriter startWriting]) { *error=_videoWriter.error; return NO; }
     [_videoWriter startSessionAtSourceTime:kCMTimeZero];
     _audioWriter=[[AVAssetWriter alloc] initWithURL:_recording.audioURL fileType:AVFileTypeAppleM4A error:error];
@@ -113,6 +117,16 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     __weak SRRecorder* weakSelf=self;
     dispatch_source_set_event_handler(_timer,^{ [weakSelf appendVideoAt:HostNow()]; });
     dispatch_resume(_timer);
+}
+- (void)detachStream {
+    [_stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+    [_stream removeStreamOutput:self type:SCStreamOutputTypeAudio error:nil];
+    _stream=nil;
+}
+- (void)cancelPreparedCapture {
+    if (_videoWriter.status==AVAssetWriterStatusWriting) [_videoWriter cancelWriting];
+    if (_audioWriter.status==AVAssetWriterStatusWriting) [_audioWriter cancelWriting];
+    [self detachStream];
 }
 - (void)appendVideoAt:(double)host {
     [self drainAudio];
@@ -216,7 +230,7 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
     dispatch_group_notify(group,_queue,^{
         NSError* error=self->_fatalError ?: self->_videoWriter.error ?: self->_audioWriter.error;
         if (self->_latestFrame) { CVPixelBufferRelease(self->_latestFrame); self->_latestFrame=nullptr; }
-        self->_stream=nil;
+        [self detachStream];
         sr::Log(@"recording-finished",[NSString stringWithFormat:@"%.3f seconds, %@",self.recordedSeconds,error.localizedDescription ?: @"OK"]);
         dispatch_async(dispatch_get_main_queue(),^{ completion(error?nil:self->_recording,error); });
     });

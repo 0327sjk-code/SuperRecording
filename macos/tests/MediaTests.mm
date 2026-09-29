@@ -206,6 +206,7 @@ int SRMediaTests(NSURL* directory) {
             [editor.window setContentSize:NSMakeSize(1000,680)];
             [editor writeUISnapshot:[directory URLByAppendingPathComponent:@"editor-compact.png"]];
             [editor close];
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
             std::cout<<"All macOS media tests passed\n"; return 0;
         } catch (const std::exception& failure) { std::cerr<<"FAIL "<<failure.what()<<'\n'; return 1; }
     } @catch (NSException* exception) { std::cerr<<"FAIL Objective-C exception "<<exception.reason.UTF8String<<'\n'; return 1; }

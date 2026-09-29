@@ -252,8 +252,10 @@ static void EnableControls(NSView* root,BOOL enabled) {
     _closed=YES; [_player pause]; [_exporter cancel];
     if (_timeObserver) { [_player removeTimeObserver:_timeObserver]; _timeObserver=nil; }
     if (_keyMonitor) { [NSEvent removeMonitor:_keyMonitor]; _keyMonitor=nil; }
+    _canvas.document=nullptr; _canvas.edited=nil; _canvas.selectionChanged=nil; _canvas.willInteract=nil;
+    _timeline.changed=nil;
     _root.resized=nil; _videoLayer.player=nil; [_player replaceCurrentItemWithPlayerItem:nil];
-    if (self.closed) self.closed();
+    void (^callback)(void)=self.closed; self.closed=nil; if (callback) callback();
 }
 - (void)writeUISnapshot:(NSURL*)url {
     [self layoutInterface]; [_root layoutSubtreeIfNeeded];
