@@ -20,7 +20,7 @@ add_executable(SuperRecording MACOSX_BUNDLE
   tests/SelfTest.mm tests/MediaTests.mm
   ../src/annotations/Annotation.cpp ../src/media/ExportQuality.cpp)
 target_include_directories(SuperRecording PRIVATE . ../src)
-target_compile_options(SuperRecording PRIVATE -fobjc-arc -Wall -Wextra -Werror
+target_compile_options(SuperRecording PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -Wall -Wextra -Werror
   -Wno-deprecated-declarations -Wno-unused-parameter)
 target_link_libraries(SuperRecording PRIVATE
   "-framework AppKit" "-framework ScreenCaptureKit" "-framework AVFoundation"

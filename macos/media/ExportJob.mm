@@ -34,7 +34,8 @@
             double duration=CMTimeGetSeconds(asset.duration);
             BOOL marks=qrec::annotations::HasVisibleMarks(request.annotations,qrec::annotations::Time{(int64_t)(request.start*1000)},
                 qrec::annotations::Time{(int64_t)ceil(request.end*1000)});
-            BOOL untouched=!request.gif && !marks && !request.audio && request.quality==100 && fabs(request.speed-1)<0.001 &&
+            BOOL sourceIsSilent=[asset tracksWithMediaType:AVMediaTypeAudio].count==0;
+            BOOL untouched=sourceIsSilent && !request.gif && !marks && !request.audio && request.quality==100 && fabs(request.speed-1)<0.001 &&
                            request.start<0.0001 && fabs(request.end-duration)<0.03;
             if (untouched) { completion(request.videoURL,nil); return; }
             NSError* error=nil;

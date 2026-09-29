@@ -6,6 +6,7 @@
 #include <algorithm>
 using namespace qrec::annotations;
 @implementation SREditorController
+@synthesize closed = _closedCallback;
 - (instancetype)initWithRecording:(SRRecording*)recording preferences:(SRPreferences*)preferences {
     NSRect visible=NSScreen.mainScreen.visibleFrame;
     NSRect frame=NSMakeRect(0,0,MIN(1500,visible.size.width-64),MIN(1000,visible.size.height-70));

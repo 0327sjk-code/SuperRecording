@@ -62,8 +62,6 @@
     NSButton* _save;
     NSTextField* _status;
 }
-- (void)buildInterface;
-- (void)layoutInterface;
 - (void)refreshLabels;
 - (void)selectTool:(NSButton*)sender;
 - (void)undo:(id)sender;
@@ -81,4 +79,8 @@
 - (void)seek:(double)time;
 - (void)prepareExport;
 - (void)annotationSelection;
+@end
+@interface SREditorController (Layout)
+- (void)buildInterface;
+- (void)layoutInterface;
 @end

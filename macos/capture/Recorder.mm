@@ -50,6 +50,9 @@ static double HostNow() { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostT
         for (SCRunningApplication* application in content.applications)
             if (application.processID==NSProcessInfo.processInfo.processIdentifier) [excluded addObject:application];
         if (!display) { dispatch_async(dispatch_get_main_queue(),^{ completion(sr::Error(@"所选显示器已断开，请重新框选。")); }); return; }
+        if (excluded.count==0) {
+            dispatch_async(dispatch_get_main_queue(),^{ completion(sr::Error(@"暂时无法排除录制控件，请退出软件后重新打开。")); }); return;
+        }
         SCContentFilter* filter=[[SCContentFilter alloc] initWithDisplay:display excludingApplications:excluded exceptingWindows:@[]];
         SCStreamConfiguration* config=[SCStreamConfiguration new]; config.sourceRect=selection.rect;
         config.width=self->_recording.size.width; config.height=self->_recording.size.height;
