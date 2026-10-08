@@ -1,6 +1,7 @@
 #include "update/detail/SelfUpdateProcess.h"
 
 #include "app/CommandLineOptions.h"
+#include "app/StartupRegistration.h"
 
 #include <windows.h>
 
@@ -48,7 +49,8 @@ private:
 [[nodiscard]] std::wstring BuildBootstrapCommandLine(
     const std::filesystem::path& downloadedExecutable,
     const std::filesystem::path& targetExecutable,
-    const std::uint32_t parentProcessId) {
+    const std::uint32_t parentProcessId,
+    const bool silent) {
     std::wstring commandLine;
     const std::wstring processId = std::to_wstring(parentProcessId);
     commandLine.reserve(
@@ -65,6 +67,10 @@ private:
     commandLine.append(L"\" ");
     commandLine.append(app::command_line::ParentProcessIdPrefix);
     commandLine.append(processId);
+    if (silent) {
+        commandLine.push_back(L' ');
+        commandLine.append(startup::AutoStartArgument);
+    }
     return commandLine;
 }
 
@@ -89,6 +95,8 @@ private:
     commandLine.push_back(L' ');
     commandLine.append(app::command_line::UpdateHealthEventPrefix);
     commandLine.append(healthEventName);
+    commandLine.push_back(L' ');
+    commandLine.append(startup::AutoStartArgument);
     return commandLine;
 }
 
@@ -99,6 +107,8 @@ private:
     commandLine.push_back(L'"');
     commandLine.append(executable.native());
     commandLine.push_back(L'"');
+    commandLine.push_back(L' ');
+    commandLine.append(startup::AutoStartArgument);
     return commandLine;
 }
 
@@ -122,6 +132,8 @@ private:
 
     STARTUPINFOW startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION processInformation{};
     const BOOL created = ::CreateProcessW(
         executable.c_str(),
@@ -129,7 +141,7 @@ private:
         nullptr,
         nullptr,
         FALSE,
-        CREATE_UNICODE_ENVIRONMENT,
+        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
         nullptr,
         workingDirectory.c_str(),
         &startupInfo,
@@ -282,14 +294,16 @@ bool LaunchBootstrapExecutable(
     const std::filesystem::path& downloadedExecutable,
     const std::filesystem::path& targetExecutable,
     const std::uint32_t parentProcessId,
-    DWORD* error) {
+    DWORD* error,
+    const bool silent) {
     return CreateProcessWithCommandLine(
         downloadedExecutable,
         downloadedExecutable.parent_path(),
         BuildBootstrapCommandLine(
             downloadedExecutable,
             targetExecutable,
-            parentProcessId),
+            parentProcessId,
+            silent),
         nullptr,
         error);
 }

@@ -4,6 +4,8 @@
 #include "common/AppMessages.h"
 #include "common/Logger.h"
 #include "common/ProductInfo.h"
+#include "common/Win32Helpers.h"
+#include "update/DailyUpdateStateStore.h"
 #include "update/UpdateCoordinator.h"
 
 #include <shellapi.h>
@@ -61,7 +63,8 @@ bool AppUpdateController::Initialize(
     const HWND messageWindow,
     TrayIcon& trayIcon,
     Logger& logger,
-    ApplyRequestedCallback applyRequested) noexcept {
+    ApplyRequestedCallback applyRequested,
+    IsIdleCallback isIdle) noexcept {
     if (coordinator_) {
         return true;
     }
@@ -71,6 +74,10 @@ bool AppUpdateController::Initialize(
     shuttingDown_ = false;
     try {
         applyRequested_ = std::move(applyRequested);
+        isIdle_ = std::move(isIdle);
+        scheduleStore_ = std::make_unique<update::DailyUpdateStateStore>(
+            win32::LocalAppDataDirectory() / L"automatic-update.ini");
+        schedule_ = update::DailyUpdatePolicy(scheduleStore_->LoadCompletedDate());
         const std::optional<update::SemanticVersion> currentVersion =
             update::SemanticVersion::Parse(product::Version);
         if (!currentVersion.has_value()) {
@@ -112,27 +119,7 @@ void AppUpdateController::HandleStatusChanged() noexcept {
         const update::UpdateSnapshot snapshot = coordinator_->Snapshot();
         switch (snapshot.phase) {
         case update::UpdatePhase::UpdateAvailable: {
-            if (downloadRequested_) {
-                break;
-            }
-            downloadRequested_ = true;
-            const std::wstring version = snapshot.latestVersion.has_value()
-                ? snapshot.latestVersion->ToWString()
-                : L"新版本";
-            LogInfo(L"GitHub Releases 发现 SuperRecording " + version +
-                    L"，开始后台下载。");
-            Notify(
-                L"发现 SuperRecording " + version,
-                L"正在后台下载更新，录屏功能可以继续使用。",
-                NIIF_INFO);
-            if (!coordinator_->DownloadAvailableUpdate()) {
-                downloadRequested_ = false;
-                LogError(L"发现新版本后无法启动下载任务。");
-                Notify(
-                    L"更新下载未启动",
-                    L"请稍后从托盘右键菜单重新检查更新。",
-                    NIIF_WARNING);
-            }
+            // Poll starts downloading only when recorder/editor activity is idle.
             break;
         }
         case update::UpdatePhase::UpToDate:
@@ -142,12 +129,15 @@ void AppUpdateController::HandleStatusChanged() noexcept {
             terminalNotification_ = TerminalNotification::UpToDate;
             downloadRequested_ = false;
             readyExecutable_.clear();
+            schedule_.Completed(ClockNow());
+            PersistCompletedDate();
             LogInfo(L"在线更新检查完成：当前已是最新版本。");
             Notify(
                 L"当前已是最新版本",
                 L"SuperRecording " + std::wstring(product::Version) +
                     L" 无需更新。",
                 NIIF_INFO);
+            automaticOperation_ = true;
             break;
         case update::UpdatePhase::ReadyToInstall: {
             downloadRequested_ = false;
@@ -165,7 +155,7 @@ void AppUpdateController::HandleStatusChanged() noexcept {
                     L" 已下载到：" + readyExecutable_.wstring());
             Notify(
                 L"SuperRecording " + version + L" 已就绪",
-                L"请在托盘右键菜单选择“重启并更新”。",
+                L"空闲后将自动更新并重新启动，不会关闭正在录制或编辑的内容。",
                 NIIF_INFO);
             break;
         }
@@ -176,6 +166,7 @@ void AppUpdateController::HandleStatusChanged() noexcept {
             terminalNotification_ = TerminalNotification::Failed;
             downloadRequested_ = false;
             readyExecutable_.clear();
+            schedule_.RetryLater(ClockNow());
             const std::wstring diagnostic = snapshot.failure.message.empty()
                 ? L"无底层诊断"
                 : snapshot.failure.message;
@@ -184,11 +175,21 @@ void AppUpdateController::HandleStatusChanged() noexcept {
                 L"在线更新失败",
                 UpdateFailureText(snapshot.failure),
                 NIIF_WARNING);
+            automaticOperation_ = true;
             break;
         }
         case update::UpdatePhase::Cancelled:
+            if (terminalNotification_ == TerminalNotification::Cancelled) break;
+            terminalNotification_ = TerminalNotification::Cancelled;
             downloadRequested_ = false;
             readyExecutable_.clear();
+            if (activityPaused_) {
+                // Activity cancellation is a deferral, not a network failure.
+                schedule_.RequestManualCheck();
+                activityPaused_ = false;
+            } else {
+                schedule_.RetryLater(ClockNow());
+            }
             break;
         case update::UpdatePhase::Idle:
         case update::UpdatePhase::Checking:
@@ -196,6 +197,7 @@ void AppUpdateController::HandleStatusChanged() noexcept {
         default:
             break;
         }
+        Poll();
     } catch (...) {
         LogError(L"在线更新状态处理失败；录屏功能不受影响。");
     }
@@ -207,7 +209,7 @@ void AppUpdateController::HandleMenuCommand(const MenuCommand command) noexcept 
         CheckForUpdates();
         break;
     case MenuCommand::ApplyDownloadedUpdate:
-        ApplyDownloadedUpdate();
+        Poll();
         break;
     default:
         break;
@@ -230,14 +232,14 @@ void AppUpdateController::AppendTrayMenu(
             (snapshot.phase == update::UpdatePhase::ReadyToInstall &&
              !snapshot.downloadedFile.empty());
         if (updateReady) {
-            std::wstring applyLabel = L"重启并更新";
+            std::wstring applyLabel = L"更新已就绪，空闲后自动重启";
             if (snapshot.latestVersion.has_value()) {
-                applyLabel.append(L"到 ");
+                applyLabel.append(L" · ");
                 applyLabel.append(snapshot.latestVersion->ToWString());
             }
             ::AppendMenuW(
                 menu,
-                MF_STRING,
+                MF_STRING | MF_GRAYED,
                 applyCommandId,
                 applyLabel.c_str());
         } else {
@@ -261,6 +263,7 @@ void AppUpdateController::AppendTrayMenu(
 
         const std::wstring versionLabel =
             L"当前版本：" + std::wstring(product::Version);
+        ::AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"自动更新：每天 11:00，空闲时安装");
         ::AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, versionLabel.c_str());
         ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     } catch (...) {
@@ -284,14 +287,18 @@ void AppUpdateController::Shutdown() noexcept {
         coordinator_.reset();
     }
     applyRequested_ = {};
+    isIdle_ = {};
+    scheduleStore_.reset();
     readyExecutable_.clear();
     terminalNotification_ = TerminalNotification::None;
     downloadRequested_ = false;
+    activityPaused_ = false;
     trayIcon_ = nullptr;
     logger_ = nullptr;
 }
 
 void AppUpdateController::CheckForUpdates() noexcept {
+    automaticOperation_ = false;
     if (!coordinator_ || shuttingDown_) {
         Notify(
             L"暂时无法检查更新",
@@ -302,7 +309,7 @@ void AppUpdateController::CheckForUpdates() noexcept {
 
     try {
         if (!readyExecutable_.empty()) {
-            ApplyDownloadedUpdate();
+            Notify(L"更新已就绪", L"空闲后将自动更新，无需手动重启。", NIIF_INFO);
             return;
         }
 
@@ -317,20 +324,13 @@ void AppUpdateController::CheckForUpdates() noexcept {
             return;
         }
 
-        readyExecutable_.clear();
-        terminalNotification_ = TerminalNotification::None;
-        downloadRequested_ = false;
-        if (!coordinator_->CheckForUpdates()) {
-            Notify(
-                L"无法开始检查更新",
-                L"更新任务暂时不可用，请稍后重试。",
-                NIIF_WARNING);
-            return;
-        }
+        schedule_.RequestManualCheck();
         Notify(
-            L"正在检查更新",
-            L"正在连接 GitHub Releases…",
+            L"检查更新已安排",
+            ApplicationIdle() ? L"将连接 GitHub Releases 并自动完成更新。"
+                              : L"录屏或编辑结束后会自动检查并更新。",
             NIIF_INFO);
+        Poll();
     } catch (...) {
         LogError(L"无法开始在线更新检查。");
         Notify(
@@ -341,7 +341,7 @@ void AppUpdateController::CheckForUpdates() noexcept {
 }
 
 void AppUpdateController::ApplyDownloadedUpdate() noexcept {
-    if (shuttingDown_) {
+    if (shuttingDown_ || !ApplicationIdle()) {
         return;
     }
 
@@ -360,6 +360,8 @@ void AppUpdateController::ApplyDownloadedUpdate() noexcept {
         if (attributes == INVALID_FILE_ATTRIBUTES ||
             (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             readyExecutable_.clear();
+            // Discard the stale ReadyToInstall snapshot by starting a fresh check.
+            StartCheck();
             Notify(
                 L"更新文件不可用",
                 L"请重新检查并下载更新。",
@@ -370,9 +372,17 @@ void AppUpdateController::ApplyDownloadedUpdate() noexcept {
         ApplyRequestedCallback applyRequested = applyRequested_;
         std::filesystem::path readyExecutable = readyExecutable_;
         if (applyRequested) {
-            applyRequested(std::move(readyExecutable));
+            schedule_.Completed(ClockNow());
+            PersistCompletedDate();
+            LogInfo(L"应用已空闲，自动安装更新并重新启动。");
+            if (!applyRequested(std::move(readyExecutable), automaticOperation_) && !shuttingDown_) {
+                schedule_.RetryLater(ClockNow());
+                automaticOperation_ = true;
+                LogError(L"更新安装未启动，将在 15 分钟后空闲时重试。");
+            }
         }
     } catch (...) {
+        schedule_.RetryLater(ClockNow());
         LogError(L"无法提交已下载的更新文件。");
         Notify(
             L"更新文件不可用",
@@ -386,7 +396,7 @@ void AppUpdateController::Notify(
     const std::wstring_view text,
     const DWORD flags) const noexcept {
     try {
-        if (trayIcon_ != nullptr) {
+        if (trayIcon_ != nullptr && !automaticOperation_) {
             trayIcon_->ShowNotification(title, text, flags);
         }
     } catch (...) {

@@ -44,7 +44,8 @@ struct BootstrapResult final {
 [[nodiscard]] BootstrapResult LaunchApplyUpdate(
     const std::filesystem::path& downloadedExecutable,
     const std::filesystem::path& targetExecutable,
-    std::uint32_t parentProcessId) noexcept;
+    std::uint32_t parentProcessId,
+    bool silent = false) noexcept;
 
 // Signals that the installed process completed application initialization.
 // Main calls this after AppController::Initialize succeeds and before Run.

@@ -6,6 +6,10 @@
 #include <mutex>
 #include <thread>
 
+#ifdef SUPERRECORDING_UPDATE_TESTS
+namespace qrec { struct UpdateControllerProbe; }
+#endif
+
 namespace qrec::update {
 
 // Coordinates one check or download at a time on a private worker thread.
@@ -44,6 +48,9 @@ public:
     [[nodiscard]] bool IsBusy() const noexcept;
 
 private:
+#ifdef SUPERRECORDING_UPDATE_TESTS
+    friend struct ::qrec::UpdateControllerProbe;
+#endif
     [[nodiscard]] bool BeginCheckWorker() noexcept;
     [[nodiscard]] bool BeginDownloadWorker(
         SemanticVersion latestVersion) noexcept;

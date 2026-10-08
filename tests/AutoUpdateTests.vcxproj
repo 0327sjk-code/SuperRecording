@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{F12E6592-59CA-46AB-B35D-083B7A173CE9}</ProjectGuid>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\tests\</OutDir><IntDir>$(ProjectDir)..\build\obj\update-tests\</IntDir>
+    <TargetName>AutoUpdateTests</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;_WIN32_WINNT=0x0A00;SUPERRECORDING_UPDATE_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /permissive- %(AdditionalOptions)</AdditionalOptions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary><MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>user32.lib;shell32.lib;advapi32.lib;winhttp.lib;dwmapi.lib;shlwapi.lib;comctl32.lib;ole32.lib;uuid.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="AutoUpdatePolicyTests.cpp" /><ClCompile Include="AutoUpdateProcessTests.cpp" />
+    <ClCompile Include="AutoUpdateControllerTests.cpp" />
+    <ClCompile Include="..\src\app\AppUpdateController.cpp" /><ClCompile Include="..\src\app\AppUpdateAutomation.cpp" />
+    <ClCompile Include="..\src\app\TrayIcon.cpp" />
+    <ClCompile Include="..\src\common\Logger.cpp" /><ClCompile Include="..\src\common\Win32Helpers.cpp" />
+    <ClCompile Include="..\src\app\CommandLineOptions.cpp" />
+    <ClCompile Include="..\src\update\DailyUpdatePolicy.cpp" /><ClCompile Include="..\src\update\DailyUpdateStateStore.cpp" />
+    <ClCompile Include="..\src\update\SelfUpdateBootstrap.cpp" />
+    <ClCompile Include="..\src\update\detail\SelfUpdatePath.cpp" /><ClCompile Include="..\src\update\detail\SelfUpdateProcess.cpp" />
+    <ClCompile Include="..\src\update\UpdateCoordinator.cpp" /><ClCompile Include="..\src\update\GitHubUpdateClient.cpp" />
+    <ClCompile Include="..\src\update\SemanticVersion.cpp" /><ClCompile Include="..\src\update\detail\HttpsUrl.cpp" />
+    <ClCompile Include="..\src\update\detail\WinHttpTransport.cpp" /><ClCompile Include="..\src\update\detail\UpdateError.cpp" />
+    <ClCompile Include="..\src\update\detail\UpdateFileStore.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

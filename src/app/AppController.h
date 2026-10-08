@@ -81,7 +81,9 @@ private:
     void ToggleStartup();
     void ToggleKeepEditorOpenAfterExport();
     void ToggleAdjustSelectionBeforeRecording();
-    void BeginApplyDownloadedUpdate(std::filesystem::path downloadedExecutable);
+    [[nodiscard]] bool BeginApplyDownloadedUpdate(
+        std::filesystem::path downloadedExecutable, bool silent);
+    [[nodiscard]] bool IsIdleForUpdate() const noexcept;
     void CompleteExit();
     void LogStartupFailure(
         std::wstring_view context,
@@ -126,6 +128,8 @@ private:
     bool exitAfterFinalize_{};
     bool launchedAtStartup_{};
     bool applyUpdateOnExit_{};
+    bool silentUpdate_{};
+    bool modalInteraction_{};
 };
 
 }  // namespace qrec

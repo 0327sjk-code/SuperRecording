@@ -2,6 +2,7 @@
 #include "app/CommandLineOptions.h"
 
 #include "common/AppMessages.h"
+#include "common/Logger.h"
 #include "common/Win32Helpers.h"
 #include "update/SelfUpdateBootstrap.h"
 
@@ -57,10 +58,15 @@ int WINAPI wWinMain(
         const qrec::update::BootstrapResult result =
             qrec::update::ApplyUpdate(request);
         if (!result.success) {
-            qrec::win32::ShowError(
-                nullptr,
-                L"SuperRecording 更新失败",
-                BootstrapErrorMessage(result));
+            if (commandLine.launchedAtStartup) {
+                qrec::Logger logger;
+                logger.Error(L"自动更新失败：" + BootstrapErrorMessage(result));
+            } else {
+                qrec::win32::ShowError(
+                    nullptr,
+                    L"SuperRecording 更新失败",
+                    BootstrapErrorMessage(result));
+            }
             return 3;
         }
         return 0;
@@ -106,10 +112,8 @@ int WINAPI wWinMain(
             qrec::update::SignalUpdateReady(
                 commandLine.updateHealthEventName);
         if (!healthResult.success) {
-            qrec::win32::ShowError(
-                nullptr,
-                L"SuperRecording 更新失败",
-                BootstrapErrorMessage(healthResult));
+            qrec::Logger logger;
+            logger.Error(L"更新启动验证失败：" + BootstrapErrorMessage(healthResult));
             ::ReleaseMutex(mutex);
             ::CloseHandle(mutex);
             return 4;

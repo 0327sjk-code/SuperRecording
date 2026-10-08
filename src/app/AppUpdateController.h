@@ -1,5 +1,7 @@
 #pragma once
 
+#include "update/DailyUpdatePolicy.h"
+
 #include <windows.h>
 
 #include <cstdint>
@@ -15,6 +17,7 @@ class TrayIcon;
 
 namespace update {
 class UpdateCoordinator;
+class DailyUpdateStateStore;
 }
 
 class AppUpdateController final {
@@ -25,7 +28,8 @@ public:
     };
 
     using ApplyRequestedCallback =
-        std::function<void(std::filesystem::path)>;
+        std::function<bool(std::filesystem::path, bool)>;
+    using IsIdleCallback = std::function<bool()>;
 
     AppUpdateController();
     ~AppUpdateController();
@@ -37,9 +41,12 @@ public:
         HWND messageWindow,
         TrayIcon& trayIcon,
         Logger& logger,
-        ApplyRequestedCallback applyRequested) noexcept;
+        ApplyRequestedCallback applyRequested,
+        IsIdleCallback isIdle) noexcept;
 
     void HandleStatusChanged() noexcept;
+    void Poll() noexcept;
+    void ObserveBusy() noexcept;
     void HandleMenuCommand(MenuCommand command) noexcept;
     void AppendTrayMenu(
         HMENU menu,
@@ -52,14 +59,23 @@ public:
     }
 
 private:
+#ifdef SUPERRECORDING_UPDATE_TESTS
+    friend struct UpdateControllerProbe;
+#endif
     enum class TerminalNotification : std::uint8_t {
         None,
         UpToDate,
         Failed,
+        Cancelled,
     };
 
     void CheckForUpdates() noexcept;
     void ApplyDownloadedUpdate() noexcept;
+    void StartCheck() noexcept;
+    void StartDownload() noexcept;
+    void PersistCompletedDate() noexcept;
+    [[nodiscard]] bool ApplicationIdle() const noexcept;
+    [[nodiscard]] static update::UpdateClock ClockNow() noexcept;
     void Notify(
         std::wstring_view title,
         std::wstring_view text,
@@ -70,10 +86,15 @@ private:
     TrayIcon* trayIcon_{};
     Logger* logger_{};
     ApplyRequestedCallback applyRequested_;
+    IsIdleCallback isIdle_;
     std::unique_ptr<update::UpdateCoordinator> coordinator_;
+    std::unique_ptr<update::DailyUpdateStateStore> scheduleStore_;
+    update::DailyUpdatePolicy schedule_;
     std::filesystem::path readyExecutable_;
     TerminalNotification terminalNotification_{TerminalNotification::None};
     bool downloadRequested_{};
+    bool automaticOperation_{true};
+    bool activityPaused_{};
     bool shuttingDown_{};
 };
 

@@ -113,6 +113,19 @@ constexpr DWORD InstalledTerminationTimeoutMs = 5'000;
         rollbackError);
 }
 
+// The parent already exited, but its file is still intact. Do not leave a silent
+// daily update with no tray process when antivirus/permissions prevent replacement.
+[[nodiscard]] BootstrapResult PreserveFailure(
+    const DWORD nativeError, const std::wstring_view message,
+    const std::filesystem::path& targetExecutable) noexcept {
+    DWORD restartError = ERROR_SUCCESS;
+    try {
+        if (!detail::LaunchExecutableNormally(targetExecutable, &restartError) &&
+            restartError == ERROR_SUCCESS) restartError = ERROR_GEN_FAILURE;
+    } catch (...) { restartError = ERROR_GEN_FAILURE; }
+    return Failure(BootstrapStage::PreservePreviousExecutable, nativeError, message, restartError);
+}
+
 [[nodiscard]] BootstrapResult HealthFailure(
     detail::InstalledProcess& installedProcess,
     DWORD nativeError,
@@ -182,20 +195,20 @@ BootstrapResult ApplyUpdate(const ApplyUpdateRequest& request) noexcept {
         if (backupAttributes != INVALID_FILE_ATTRIBUTES &&
             ((backupAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
              (backupAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)) {
-            return Failure(
-                BootstrapStage::PreservePreviousExecutable,
+            return PreserveFailure(
                 ERROR_CANT_ACCESS_FILE,
-                L"旧版备份路径被目录或重解析点占用，无法安全更新。");
+                L"旧版备份路径被目录或重解析点占用，无法安全更新；已尝试重新启动旧版。",
+                targetExecutable);
         }
 
         if (::MoveFileExW(
                 targetExecutable.c_str(),
                 backupExecutable.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
-            return Failure(
-                BootstrapStage::PreservePreviousExecutable,
+            return PreserveFailure(
                 ::GetLastError(),
-                L"无法保留旧版 SuperRecording.exe。");
+                L"无法保留旧版 SuperRecording.exe；已尝试重新启动旧版。",
+                targetExecutable);
         }
         rollbackRequired = true;
 
@@ -313,7 +326,8 @@ BootstrapResult ApplyUpdate(const ApplyUpdateRequest& request) noexcept {
 BootstrapResult LaunchApplyUpdate(
     const std::filesystem::path& downloadedExecutable,
     const std::filesystem::path& targetExecutable,
-    const std::uint32_t parentProcessId) noexcept {
+    const std::uint32_t parentProcessId,
+    const bool silent) noexcept {
     try {
         DWORD nativeError = ERROR_SUCCESS;
         const std::filesystem::path normalizedDownload =
@@ -339,7 +353,8 @@ BootstrapResult LaunchApplyUpdate(
                 normalizedDownload,
                 normalizedTarget,
                 parentProcessId,
-                &nativeError)) {
+                &nativeError,
+                silent)) {
             return Failure(
                 BootstrapStage::LaunchBootstrapExecutable,
                 nativeError,

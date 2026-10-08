@@ -43,7 +43,8 @@ private:
     const std::filesystem::path& downloadedExecutable,
     const std::filesystem::path& targetExecutable,
     std::uint32_t parentProcessId,
-    DWORD* error);
+    DWORD* error,
+    bool silent = false);
 
 [[nodiscard]] bool LaunchInstalledExecutable(
     const std::filesystem::path& targetExecutable,

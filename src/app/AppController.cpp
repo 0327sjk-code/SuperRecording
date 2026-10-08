@@ -3,6 +3,7 @@
 #include "app/CacheMaintenance.h"
 #include "app/FolderPicker.h"
 #include "app/HotkeyEditorDialog.h"
+#include "app/UpdateActivity.h"
 #include "app/resource.h"
 #include "common/AppMessages.h"
 #include "common/ProductInfo.h"
@@ -26,6 +27,20 @@ namespace {
 
 constexpr int kHotkeySlotA = 1;
 constexpr int kHotkeySlotB = 2;
+constexpr UINT_PTR kAutomaticUpdateTimer = 0x5352;
+constexpr UINT kAutomaticUpdatePollMilliseconds = 1'000;
+
+// Keep nested Win32 modal message loops from installing while settings/menu UI is open.
+class ModalInteraction final {
+public:
+    explicit ModalInteraction(bool& flag) noexcept : flag_(flag), previous_(flag) { flag_ = true; }
+    ~ModalInteraction() { flag_ = previous_; }
+    ModalInteraction(const ModalInteraction&) = delete;
+    ModalInteraction& operator=(const ModalInteraction&) = delete;
+private:
+    bool& flag_;
+    bool previous_;
+};
 
 constexpr bool ShouldCloseEditorAfterExport(
     const bool exportSucceeded,
@@ -222,9 +237,10 @@ bool AppController::Initialize() {
         window_,
         trayIcon_,
         logger_,
-        [this](std::filesystem::path downloadedExecutable) {
-            BeginApplyDownloadedUpdate(std::move(downloadedExecutable));
-        }));
+        [this](std::filesystem::path downloadedExecutable, const bool silent) {
+            return BeginApplyDownloadedUpdate(std::move(downloadedExecutable), silent);
+        },
+        [this]() noexcept { return IsIdleForUpdate(); }));
 
     hotkeyRegistered_ = ::RegisterHotKey(
         window_,
@@ -254,6 +270,8 @@ bool AppController::Initialize() {
             NIIF_INFO);
     }
     ReconcileStartupAtLaunch();
+    if (::SetTimer(window_, kAutomaticUpdateTimer, kAutomaticUpdatePollMilliseconds, nullptr) == 0)
+        logger_.Error(L"自动更新定时器创建失败；仍可从托盘手动检查更新。");
     return true;
 }
 
@@ -386,6 +404,21 @@ LRESULT AppController::HandleMessage(
     }
 
     switch (message) {
+    case WM_TIMER:
+        if (wParam == kAutomaticUpdateTimer) appUpdateController_.Poll();
+        return 0;
+
+    case WM_TIMECHANGE:
+        appUpdateController_.Poll();
+        return 0;
+
+    case WM_POWERBROADCAST:
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            appUpdateController_.ObserveBusy();
+            appUpdateController_.Poll();
+        }
+        return TRUE;
+
     case WM_HOTKEY:
         if (!hotkeyEditorOpen_ && hotkeyRegistered_ &&
             static_cast<int>(wParam) == activeHotkeyId_) {
@@ -487,6 +520,7 @@ void AppController::StartSelection() {
     }
 
     state_ = RecordingState::Selecting;
+    appUpdateController_.ObserveBusy();
     const std::optional<IntRect> selected = selector_.Select(
         window_,
         settings_.adjustSelectionBeforeRecording);
@@ -866,6 +900,8 @@ void AppController::CloseEditorAfterExport() {
 }
 
 void AppController::ShowTrayMenu() {
+    ModalInteraction interaction(modalInteraction_);
+    appUpdateController_.ObserveBusy();
     HMENU menu = ::CreatePopupMenu();
     if (menu == nullptr) {
         return;
@@ -1125,6 +1161,8 @@ void AppController::UpdateHotkeyPresentation() {
 }
 
 void AppController::ChooseSaveDirectory() {
+    ModalInteraction interaction(modalInteraction_);
+    appUpdateController_.ObserveBusy();
     const std::optional<std::filesystem::path> selected =
         PickSaveDirectory(window_, settings_.saveDirectory);
     if (!selected.has_value()) {
@@ -1187,14 +1225,25 @@ void AppController::ToggleAdjustSelectionBeforeRecording() {
             : L"已关闭框选后调整选区；下次松开鼠标后立即开始录制。");
 }
 
-void AppController::BeginApplyDownloadedUpdate(
-    std::filesystem::path downloadedExecutable) {
-    if (downloadedExecutable.empty()) {
-        return;
+bool AppController::IsIdleForUpdate() const noexcept {
+    // Even a minimized editor owns unsaved work and must block automatic restart.
+    return UpdateActivity{
+        state_, editor_ != nullptr, hotkeyEditorOpen_ || modalInteraction_,
+        shuttingDown_ || exitAfterFinalize_ || applyUpdateOnExit_,
+        window_ != nullptr && ::IsWindowEnabled(window_) != FALSE}.IsIdle();
+}
+
+bool AppController::BeginApplyDownloadedUpdate(
+    std::filesystem::path downloadedExecutable, const bool silent) {
+    // Re-check at the final hand-off; never use RequestExit() to close active work.
+    if (downloadedExecutable.empty() || !IsIdleForUpdate()) {
+        return false;
     }
     updateExecutableToApply_ = std::move(downloadedExecutable);
     applyUpdateOnExit_ = true;
-    RequestExit();
+    silentUpdate_ = silent;
+    CompleteExit();
+    return shuttingDown_;
 }
 
 void AppController::ReconcileStartupAtLaunch() {
@@ -1358,14 +1407,15 @@ void AppController::CompleteExit() {
             const std::wstring message = L"无法读取当前程序路径：" +
                 win32::FormatLastError(pathError);
             logger_.Error(L"无法启动更新：" + message);
-            win32::ShowError(window_, L"SuperRecording 更新失败", message);
+            if (!silentUpdate_) win32::ShowError(window_, L"SuperRecording 更新失败", message);
             return;
         }
 
         const update::BootstrapResult launchResult = update::LaunchApplyUpdate(
             updateExecutableToApply_,
             targetExecutable,
-            ::GetCurrentProcessId());
+            ::GetCurrentProcessId(),
+            silentUpdate_);
         if (!launchResult.success) {
             applyUpdateOnExit_ = false;
             exitAfterFinalize_ = false;
@@ -1377,7 +1427,7 @@ void AppController::CompleteExit() {
                 message.append(win32::FormatLastError(launchResult.nativeError));
             }
             logger_.Error(L"无法启动更新：" + message);
-            win32::ShowError(window_, L"SuperRecording 更新失败", message);
+            if (!silentUpdate_) win32::ShowError(window_, L"SuperRecording 更新失败", message);
             return;
         }
         logger_.Info(L"新版更新引导程序已启动，当前实例开始安全退出。");
@@ -1423,6 +1473,7 @@ void AppController::Shutdown() {
     }
     shuttingDown_ = true;
     if (window_ != nullptr) {
+        ::KillTimer(window_, kAutomaticUpdateTimer);
         static_cast<void>(::UnregisterHotKey(window_, kHotkeySlotA));
         static_cast<void>(::UnregisterHotKey(window_, kHotkeySlotB));
         hotkeyRegistered_ = false;
